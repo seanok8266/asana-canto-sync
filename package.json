@@ -1,0 +1,13 @@
+{
+  "name": "asana-canto-sync",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "pg": "^8.11.1",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.0.3"
+  }
+}
