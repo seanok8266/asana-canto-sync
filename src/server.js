@@ -28,7 +28,7 @@ app.get("/connect/asana", (req, res) => {
 });
 
 // ✅ Step 2: OAuth callback → exchange code → store token in DB
-app.get("/oauth/asana/callback", async (req, res) => {
+app.get("/oauth/callback/asana", async (req, res) => {
   const code = req.query.code;
 
   if (!code) {
