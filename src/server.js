@@ -65,4 +65,8 @@ app.get("/oauth/callback/asana", async (req, res) => {
 
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+import { initDB } from "./db.js";
+
+initDB().then(() => {
+  app.listen(port, () => console.log(`Server running on port ${port}`));
+});
