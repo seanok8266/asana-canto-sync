@@ -1,15 +1,21 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
+import { saveToken } from "./db.js";
+import { initDB } from "./db.js";
+
 dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
 
+// Health check route
 app.get("/", (req, res) => {
   res.send("Asana ↔ Canto Sync Service Running");
 });
 
+// ✅ Step 1: Redirect user to Asana OAuth screen
 app.get("/connect/asana", (req, res) => {
   const clientId = process.env.ASANA_CLIENT_ID;
   const redirectUri = process.env.ASANA_REDIRECT_URI;
@@ -21,12 +27,11 @@ app.get("/connect/asana", (req, res) => {
   res.redirect(authUrl);
 });
 
-import fetch from "node-fetch"; // add this at the top if not already present
+// ✅ Step 2: OAuth callback → exchange code → store token in DB
+app.get("/oauth/asana/callback", async (req, res) => {
+  const code = req.query.code;
 
-app.get("/oauth/callback/asana", async (req, res) => {
-  const authCode = req.query.code;
-
-  if (!authCode) {
+  if (!code) {
     return res.status(400).send("Missing authorization code.");
   }
 
@@ -39,7 +44,7 @@ app.get("/oauth/callback/asana", async (req, res) => {
         client_id: process.env.ASANA_CLIENT_ID,
         client_secret: process.env.ASANA_CLIENT_SECRET,
         redirect_uri: process.env.ASANA_REDIRECT_URI,
-        code: authCode,
+        code
       }),
     });
 
@@ -49,24 +54,23 @@ app.get("/oauth/callback/asana", async (req, res) => {
       return res.status(400).send("Token exchange failed: " + tokenData.error);
     }
 
-    // ✅ For now, show the access token (temporary). We will store it next.
-    res.send(`
-      <h2>✅ Asana Connected!</h2>
-      <p>Access Token:</p>
-      <pre>${JSON.stringify(tokenData, null, 2)}</pre>
-      <p><strong>Copy this token — we will save it to your database next.</strong></p>
-    `);
+    // ✅ Save token to database
+    await saveToken("asana", {
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      expires_at: new Date(Date.now() + tokenData.expires_in * 1000)
+    });
+
+    res.send("✅ Asana connected and token saved to database!");
 
   } catch (err) {
-    console.error(err);
+    console.error("OAuth error:", err);
     res.status(500).send("Server error exchanging token.");
   }
 });
 
-
+// ✅ Start server after DB is ready
 const port = process.env.PORT || 3000;
-import { initDB } from "./db.js";
-
 initDB().then(() => {
   app.listen(port, () => console.log(`Server running on port ${port}`));
 });
