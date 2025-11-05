@@ -8,12 +8,94 @@ dotenv.config();
 
 // ✅ Initialize app FIRST
 const app = express();
+app.use(bodyParser.json());
+
+// Temporary in-memory fallback (for dev/testing)
+const cantoTokens = {};
+
 
 // ✅ Then use middlewares
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
+
+app.get("/oauth/callback/canto", async (req, res) => {
+  const { code, state } = req.query; // state = e.g. "thedamconsultants.canto.com"
+  console.log("🎯 Callback hit with query:", req.query);
+
+  try {
+    // Exchange authorization code for access token
+    const tokenResponse = await fetch("https://oauth.canto.com/oauth/api/oauth2/compatible/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        code,
+        grant_type: "authorization_code",
+        redirect_uri: "https://asana-canto-sync.onrender.com/oauth/callback/canto",
+        app_id: process.env.CANTO_APP_ID,
+        app_secret: process.env.CANTO_APP_SECRET,
+      }),
+    });
+
+    const tokenData = await tokenResponse.json();
+    tokenData.domain = state; // ✅ attach domain
+
+    // Save to DB
+    await saveToken(state, tokenData);
+
+    // Also keep it in memory for quick access (optional)
+    cantoTokens[state] = tokenData;
+
+    console.log("🌍 Saved domain for token:", state);
+    res.send("✅ Canto connection successful. You can close this window.");
+  } catch (err) {
+    console.error("Canto OAuth error:", err);
+    res.status(500).send("OAuth failed");
+  }
+});
+
+app.post("/upload", async (req, res) => {
+  const { attachmentUrl, domain } = req.body;
+
+  // Try to get from DB first, fallback to memory
+  let tokenData = await getToken(domain);
+  if (!tokenData) tokenData = cantoTokens[domain];
+
+  if (!tokenData || !tokenData.domain) {
+    console.error("❌ No valid token found for domain:", domain);
+    return res.status(400).json({ error: "Canto token not found or invalid domain" });
+  }
+
+  const uploadUrl = `https://${tokenData.domain}/api/v1/upload`;
+  console.log("📤 Uploading to:", uploadUrl);
+  console.log("🔑 Using token (first 10 chars):", tokenData.access_token.slice(0, 10));
+
+  try {
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url: attachmentUrl,
+        folder: "asana-sync",
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(errorText);
+    }
+
+    const data = await response.json();
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("Canto upload error:", err);
+    res.status(500).json({ error: "Error uploading file to Canto" });
+  }
+});
 
 
 // -------------------------
