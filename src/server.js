@@ -2,16 +2,19 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { initDB, saveToken, getToken } from "./db.js";
-
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
+import { initDB, saveToken, getToken } from "./db.js"; // make sure getToken is imported too!
 
 dotenv.config();
+
+// ✅ Initialize app FIRST
 const app = express();
+
+// ✅ Then use middlewares
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
+
 
 // -------------------------
 // Home Route
