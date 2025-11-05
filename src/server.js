@@ -77,16 +77,15 @@ app.get("/connect/canto", (req, res) => {
 app.post("/connect/canto/start", (req, res) => {
   const userDomain = req.body.domain.trim();
 
-const authUrl =
-  "https://oauth.canto.com/oauth/authorize?" +
-  new URLSearchParams({
-    client_id: process.env.CANTO_CLIENT_ID,
-    redirect_uri: process.env.CANTO_REDIRECT_URI,
-    response_type: "code",
-    scope: "openapi",
-    account_domain: userDomain, // ✅ REQUIRED FOR THE CORRECT LOGIN SCREEN
-    state: userDomain // ✅ Still keep to save domain later
-  });
+  const authUrl =
+    "https://oauth.canto.com/oauth/authorize?" +
+    new URLSearchParams({
+      client_id: process.env.CANTO_CLIENT_ID,
+      redirect_uri: process.env.CANTO_REDIRECT_URI,
+      response_type: "code",
+      scope: "openapi",
+      state: userDomain   // ✅ Send domain through OAuth state
+    });
 
   res.redirect(authUrl);
 });
@@ -116,8 +115,7 @@ app.get("/oauth/callback/canto", async (req, res) => {
     if (tokenData.error)
       return res.status(400).send("Token exchange failed: " + tokenData.error);
 
-    // ✅ Store the domain for API use later
-    tokenData.domain = userDomain;
+    tokenData.domain = userDomain; // ✅ Store domain for API calls
     await saveToken("canto", tokenData);
 
     res.send(`<h2>✅ Canto Connected for <strong>${userDomain}</strong>!</h2>
@@ -126,7 +124,8 @@ app.get("/oauth/callback/canto", async (req, res) => {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
   }
-}); // ✅ <-- This was missing
+});
+
 
 // =========================
 // Start Server
