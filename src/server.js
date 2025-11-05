@@ -116,6 +116,59 @@ app.get("/oauth/callback/canto", async (req, res) => {
 // =========================
 // Start Server
 // =========================
+// =====================
+// 🌐 CANTO OAUTH FLOW
+// =====================
+
+// Step 1: Redirect user to Canto OAuth page
+app.get("/connect/canto", (req, res) => {
+  const authUrl =
+    "https://oauth.canto.com/oauth/authorize?" +
+    new URLSearchParams({
+      client_id: process.env.CANTO_CLIENT_ID,
+      redirect_uri: process.env.CANTO_REDIRECT_URI,
+      response_type: "code",
+      scope: "openapi",
+    });
+
+  res.redirect(authUrl);
+});
+
+// Step 2: Canto OAuth Callback -> Exchange Code for Access Token
+app.get("/oauth/callback/canto", async (req, res) => {
+  const authCode = req.query.code;
+  if (!authCode) return res.status(400).send("Missing authorization code");
+
+  try {
+    const response = await fetch("https://oauth.canto.com/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: process.env.CANTO_CLIENT_ID,
+        client_secret: process.env.CANTO_CLIENT_SECRET,
+        redirect_uri: process.env.CANTO_REDIRECT_URI,
+        code: authCode,
+      }),
+    });
+
+    const tokenData = await response.json();
+    if (tokenData.error) {
+      return res.status(400).send("Token exchange failed: " + tokenData.error);
+    }
+
+    await saveToken(tokenData);
+
+    res.send(`
+      <h2>✅ Canto Connected & Token Saved!</h2>
+      <p>You can close this window.</p>
+    `);
+  } catch (err) {
+    console.error("Canto OAuth error:", err);
+    res.status(500).send("Server error exchanging token.");
+  }
+});
+
 const port = process.env.PORT || 3000;
 initDB().then(() => {
   app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
