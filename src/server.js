@@ -61,7 +61,7 @@ app.get("/oauth/callback/asana", async (req, res) => {
 // ✅ MULTI-TENANT CANTO FLOW
 // =========================
 
-// Step 1: Ask user for their specific Canto domain
+// Step 1: Show domain entry UI
 app.get("/connect/canto", (req, res) => {
   res.send(`
     <h1>Connect to Canto</h1>
@@ -75,7 +75,7 @@ app.get("/connect/canto", (req, res) => {
 
 // Step 2: Redirect user to Canto OAuth
 app.post("/connect/canto/start", (req, res) => {
-  const userDomain = req.body.domain.trim(); // ex: thedamconsultants.canto.com
+  const userDomain = req.body.domain.trim();
 
   const authUrl =
     "https://oauth.canto.com/oauth/authorize?" +
@@ -84,17 +84,16 @@ app.post("/connect/canto/start", (req, res) => {
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
       scope: "openapi",
-      account_domain: userDomain, // ✅ REQUIRED for login
-      state: userDomain,          // ✅ So we get domain back later
+      state: userDomain // ✅ Store domain temporarily
     });
 
   res.redirect(authUrl);
 });
 
-// Step 3: OAuth callback → exchange token (also tenant-specific)
+// Step 3: OAuth callback → Exchange Code
 app.get("/oauth/callback/canto", async (req, res) => {
   const authCode = req.query.code;
-  const userDomain = req.query.state; // ✅ Domain recovered from state
+  const userDomain = req.query.state; // ✅ Domain recovered here
 
   if (!authCode || !userDomain)
     return res.status(400).send("Missing authorization code or domain");
@@ -108,8 +107,7 @@ app.get("/oauth/callback/canto", async (req, res) => {
         client_id: process.env.CANTO_CLIENT_ID,
         client_secret: process.env.CANTO_CLIENT_SECRET,
         redirect_uri: process.env.CANTO_REDIRECT_URI,
-        code: authCode,
-        account_domain: userDomain, // ✅ Needed for token exchange
+        code: authCode
       }),
     });
 
@@ -117,19 +115,21 @@ app.get("/oauth/callback/canto", async (req, res) => {
     if (tokenData.error)
       return res.status(400).send("Token exchange failed: " + tokenData.error);
 
+    // ✅ Store the domain for API use later
     tokenData.domain = userDomain;
     await saveToken("canto", tokenData);
 
-    res.send(`<h2>✅ Canto Connected for ${userDomain}!</h2>`);
+    res.send(`<h2>✅ Canto Connected for <strong>${userDomain}</strong>!</h2>
+              <p>You can close this window.</p>`);
   } catch (err) {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
   }
+}); // ✅ <-- This was missing
 
-
-// -------------------------
+// =========================
 // Start Server
-// -------------------------
+// =========================
 const port = process.env.PORT || 3000;
 initDB().then(() => {
   app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
