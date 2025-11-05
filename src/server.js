@@ -405,7 +405,7 @@ app.post("/test/upload-canto", async (req, res) => {
       return res.status(400).send("Canto token not found for this domain.");
     }
 
-    const uploadUrl = `https://${domain}/api/v1/files`;
+  const uploadUrl = `https://${domain}/api/v1/import/upload`;
     console.log("📤 Uploading to:", uploadUrl);
 
     try {
