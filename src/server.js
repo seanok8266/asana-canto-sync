@@ -373,6 +373,37 @@ app.post("/webhook/asana", (req, res) => {
   res.status(200).send("OK");
 });
 
+app.post("/test/upload-canto", async (req, res) => {
+  try {
+    const tokenRecord = await getToken("canto");
+    if (!tokenRecord || !tokenRecord.access_token) {
+      return res.status(400).send("Canto token not found. Please reconnect Canto first.");
+    }
+
+    const uploadUrl = `https://${tokenRecord.domain}/api/v1/upload`;
+
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokenRecord.access_token}`,
+      },
+      body: req.body, // Postman will provide this as the raw file
+    });
+
+    const data = await response.json();
+    console.log("📤 Canto upload response:", data);
+
+    if (data.error) {
+      return res.status(400).send("Canto upload failed: " + JSON.stringify(data.error));
+    }
+
+    res.send(`<h2>✅ File uploaded to Canto!</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
+  } catch (err) {
+    console.error("Canto upload error:", err);
+    res.status(500).send("Error uploading file to Canto.");
+  }
+});
+
 
 // =========================
 // 🚀 START SERVER
