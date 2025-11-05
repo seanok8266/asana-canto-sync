@@ -129,7 +129,6 @@ if (tokenData.access_token && tokenData.refresh_token) {
 });
 
 app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), async (req, res) => {
-  // 🧩 Normalize and sanitize project IDs
   let projectIds = req.body.projectIds;
   if (!Array.isArray(projectIds)) {
     projectIds = [projectIds];
@@ -151,19 +150,18 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
 
     console.log("🔍 Project IDs received from form:", projectIds);
 
-    // 🔁 Loop through each selected project
     for (const projectId of projectIds) {
       console.log("🔧 Registering webhook for:", projectId);
 
       const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${tokenRecord.access_token}`,
-          "Content-Type": "application/json",
+          "Authorization": `Bearer ${tokenRecord.access_token}`,
+          "Content-Type": "application/x-www-form-urlencoded", // ✅ Asana expects URL-encoded form data
         },
-        body: JSON.stringify({
-          resource: projectId.toString(), // ✅ Ensure string type
-          target: "https://asana-canto-sync.onrender.com/webhook/asana", // ✅ Explicit URL
+        body: new URLSearchParams({
+          resource: projectId.toString(),
+          target: "https://asana-canto-sync.onrender.com/webhook/asana",
         }),
       });
 
@@ -182,12 +180,10 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
       if (success) successfulProjects.push(projectId);
     }
 
-    // 🧠 Store successfully registered project IDs in DB (optional, for persistence)
     if (successfulProjects.length) {
       console.log("💾 Successfully registered webhooks for:", successfulProjects);
     }
 
-    // ✅ Display results to user
     res.send(`
       <h2>🪝 Webhook Setup Complete</h2>
       <ul>
@@ -207,6 +203,7 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
     res.status(500).send("Server error registering webhooks.");
   }
 });
+
 
 
 
