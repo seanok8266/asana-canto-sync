@@ -94,6 +94,49 @@ app.post("/register/asana-webhook", async (req, res) => {
   }
 });
 
+// =========================
+// 📋 LIST ASANA PROJECTS (for multi-tenant selection)
+// =========================
+app.get("/list/asana-projects", async (req, res) => {
+  try {
+    const tokenRecord = await getToken("asana");
+    if (!tokenRecord || !tokenRecord.access_token) {
+      return res.status(400).send("Asana token not found. Please connect Asana first.");
+    }
+
+    const response = await fetch("https://app.asana.com/api/1.0/projects", {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${tokenRecord.access_token}`,
+      },
+    });
+
+    const data = await response.json();
+    if (data.errors) {
+      console.error("❌ Asana API error:", data.errors);
+      return res.status(400).send("Error fetching projects: " + JSON.stringify(data.errors));
+    }
+
+    const projects = data.data.map((p) => ({
+      id: p.gid,
+      name: p.name,
+    }));
+
+    console.log("📋 Projects fetched:", projects);
+
+    res.send(`
+      <h2>🗂️ Your Asana Projects</h2>
+      <ul>
+        ${projects.map((p) => `<li>${p.name} (ID: ${p.id})</li>`).join("")}
+      </ul>
+      <p>Use one of these IDs when registering a webhook via POST /register/asana-webhook</p>
+    `);
+  } catch (err) {
+    console.error("Error listing projects:", err);
+    res.status(500).send("Server error fetching Asana projects.");
+  }
+});
+
 
 // =========================
 // ✅ CANTO OAUTH2 (COMPATIBLE ENDPOINT)
