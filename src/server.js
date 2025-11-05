@@ -389,6 +389,7 @@ app.post("/test/upload-canto", async (req, res) => {
     fileName = info.filename;
     mimeType = info.mimeType;
     console.log("📦 Uploading file:", info);
+
     file.on("data", (data) => chunks.push(data));
     file.on("end", () => {
       fileBuffer = Buffer.concat(chunks);
@@ -400,13 +401,27 @@ app.post("/test/upload-canto", async (req, res) => {
     if (!fileBuffer) return res.status(400).send("No file received.");
 
     const tokenRecord = await getToken(domain);
-    if (!tokenRecord || !tokenRecord.access_token) {
+    if (!tokenRecord?.access_token) {
       return res.status(400).send("Canto token not found for this domain.");
     }
 
-    const uploadUrl = `https://${domain}/api/v1/files`;
+    // 🔍 Step 1: Discover upload URL from Canto
+    let uploadUrl;
+    try {
+      const infoRes = await fetch(`https://${domain}/api/v1/info`, {
+        headers: { Authorization: `Bearer ${tokenRecord.access_token}` },
+      });
+      const infoJson = await infoRes.json();
+      uploadUrl = infoJson?.upload_url || infoJson?.urls?.upload;
+      console.log("📡 Discovered upload URL:", uploadUrl);
+    } catch (err) {
+      console.warn("⚠️ Could not fetch /api/v1/info, falling back to default /api/v1/upload");
+    }
+
+    if (!uploadUrl) uploadUrl = `https://${domain}/api/v1/upload`;
     console.log("📤 Uploading to:", uploadUrl);
 
+    // 🔼 Step 2: Perform the upload
     try {
       const form = new FormData();
       form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
@@ -436,13 +451,14 @@ app.post("/test/upload-canto", async (req, res) => {
         res.status(400).json({ error: data });
       }
     } catch (err) {
-      console.error("❌ Canto upload error:", err);
+      console.error("Canto upload error:", err);
       res.status(500).send("Error uploading file to Canto.");
     }
   });
 
   req.pipe(busboy);
 });
+
 
 
 
