@@ -373,38 +373,74 @@ app.post("/upload", async (req, res) => {
 
 // Simple manual test route (JSON body)
 app.post("/test/upload-canto", async (req, res) => {
-  const { domain, sourceUrl, folder = "asana-sync" } = req.body;
-  if (!domain || !sourceUrl) return res.status(400).send("Provide domain and sourceUrl");
-
   try {
-    let tokenRecord = await getToken(domain);
-    if (!tokenRecord) tokenRecord = cantoTokens[domain];
-    if (!tokenRecord?.access_token) return res.status(400).send("Canto token not found. Please reconnect Canto first.");
+    // Parse domain
+    const domain = req.body.domain;
+    if (!domain) {
+      return res.status(400).send("Missing domain field.");
+    }
 
-    const uploadUrl = `https://${tokenRecord.domain}/api/v1/upload`;
+    const tokenRecord = await getToken("canto");
+    if (!tokenRecord || !tokenRecord.access_token) {
+      return res.status(400).send("Canto token not found. Please reconnect Canto first.");
+    }
+
+    const uploadUrl = `https://${domain}/api/v1/upload`;
     console.log("📤 Uploading to:", uploadUrl);
     console.log("🔑 Using token (first 10 chars):", tokenRecord.access_token.slice(0, 10) + "...");
 
-    const response = await fetch(uploadUrl, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${tokenRecord.access_token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ url: sourceUrl, folder }),
+    // Use multer to handle multipart file input
+    const busboy = await import("busboy");
+    const bb = busboy.default({ headers: req.headers });
+    let fileBuffer, fileName;
+
+    req.pipe(bb);
+
+    bb.on("file", (name, file, info) => {
+      fileName = info.filename;
+      const chunks = [];
+      file.on("data", (data) => chunks.push(data));
+      file.on("end", () => {
+        fileBuffer = Buffer.concat(chunks);
+      });
     });
 
-    const text = await response.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    bb.on("finish", async () => {
+      if (!fileBuffer) {
+        return res.status(400).send("No file uploaded.");
+      }
 
-    if (response.ok) {
-      res.send(`<h2>✅ File uploaded to Canto!</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
-    } else {
-      res.status(400).send(`<h2>❌ Upload failed</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
-    }
+      // Send to Canto
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tokenRecord.access_token}`,
+        },
+        body: fileBuffer,
+      });
+
+      const text = await response.text();
+      console.log("📩 Raw response from Canto:", text);
+
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { raw: text };
+      }
+
+      if (response.ok) {
+        res.json({ success: true, file: fileName, data });
+      } else {
+        res.status(400).json({ success: false, file: fileName, error: data });
+      }
+    });
   } catch (err) {
     console.error("Canto upload error:", err);
     res.status(500).send("Error uploading file to Canto.");
   }
 });
+
 
 /* ========================
    ASANA WEBHOOK HANDLER
