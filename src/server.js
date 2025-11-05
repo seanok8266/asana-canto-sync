@@ -271,7 +271,7 @@ app.get("/oauth/callback/canto", async (req, res) => {
 
   try {
     // 🔹 Use the user's domain for the token exchange, not hard-coded oauth.canto.com
-    const tokenUrl = `https://${state}/api/oauth2/compatible/token`;
+   const tokenUrl = "https://oauth.canto.com/oauth/api/oauth2/compatible/token";
 console.log("🧩 Exchanging token at:", tokenUrl);
     const response = await fetch(tokenUrl, {
       method: "POST",
