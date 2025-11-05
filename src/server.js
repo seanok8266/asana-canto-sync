@@ -405,23 +405,27 @@ app.post("/test/upload-canto", async (req, res) => {
       return res.status(400).send("Canto token not found for this domain.");
     }
 
-    // 🔍 Step 1: Discover upload URL from Canto
-    let uploadUrl;
+    let apiBase = null;
     try {
+      console.log(`🌍 Checking API base for ${domain}...`);
       const infoRes = await fetch(`https://${domain}/api/v1/info`, {
         headers: { Authorization: `Bearer ${tokenRecord.access_token}` },
       });
-      const infoJson = await infoRes.json();
-      uploadUrl = infoJson?.upload_url || infoJson?.urls?.upload;
-      console.log("📡 Discovered upload URL:", uploadUrl);
+      const infoText = await infoRes.text();
+      console.log("ℹ️ /info raw:", infoText.slice(0, 300));
+
+      const info = JSON.parse(infoText);
+      apiBase = info?.api_base_url || info?.upload_url || info?.urls?.upload;
     } catch (err) {
-      console.warn("⚠️ Could not fetch /api/v1/info, falling back to default /api/v1/upload");
+      console.warn("⚠️ Failed to get /api/v1/info:", err);
     }
 
-    if (!uploadUrl) uploadUrl = `https://${domain}/api/v1/upload`;
+    // ✅ Pick fallback if none found
+    const uploadUrl =
+      apiBase?.includes("http") ? `${apiBase}/api/v1/upload` : `https://api.canto.com/api/v1/upload`;
+
     console.log("📤 Uploading to:", uploadUrl);
 
-    // 🔼 Step 2: Perform the upload
     try {
       const form = new FormData();
       form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
@@ -436,7 +440,7 @@ app.post("/test/upload-canto", async (req, res) => {
       });
 
       const text = await response.text();
-      console.log("📩 Raw response from Canto:", text);
+      console.log("📩 Raw response from Canto:", text.slice(0, 400));
 
       let data;
       try {
@@ -451,13 +455,14 @@ app.post("/test/upload-canto", async (req, res) => {
         res.status(400).json({ error: data });
       }
     } catch (err) {
-      console.error("Canto upload error:", err);
+      console.error("❌ Canto upload error:", err);
       res.status(500).send("Error uploading file to Canto.");
     }
   });
 
   req.pipe(busboy);
 });
+
 
 
 
