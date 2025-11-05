@@ -125,7 +125,6 @@ app.get("/oauth/callback/canto", async (req, res) => {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
   }
-});
 
 
 // -------------------------
