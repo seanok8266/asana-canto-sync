@@ -32,7 +32,8 @@ app.get("/oauth/callback/asana", async (req, res) => {
   if (!authCode) return res.status(400).send("Missing authorization code");
 
   try {
-    const response = await fetch("https://app.asana.com/-/oauth_token", {
+    // 1️⃣ Exchange code for token
+    const tokenResponse = await fetch("https://app.asana.com/-/oauth_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -44,17 +45,104 @@ app.get("/oauth/callback/asana", async (req, res) => {
       }),
     });
 
-    const tokenData = await response.json();
+    const tokenData = await tokenResponse.json();
     if (tokenData.error)
       return res.status(400).send("Token exchange failed: " + tokenData.error);
 
     await saveToken("asana", tokenData);
-    res.send(`<h2>✅ Asana Connected & Token Saved!</h2>`);
+
+    // 2️⃣ Fetch all projects
+    const projectResponse = await fetch("https://app.asana.com/api/1.0/projects", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+
+    const projectList = await projectResponse.json();
+    if (!projectList.data?.length) {
+      return res.send(`<h2>✅ Asana Connected, but no projects found.</h2>`);
+    }
+
+    // 3️⃣ Show project selection form
+    res.send(`
+      <h2>✅ Asana Connected!</h2>
+      <h3>Select one or more projects to activate webhooks:</h3>
+      <form action="/register/asana-webhooks" method="POST">
+        ${projectList.data
+          .map(
+            (p) => `
+          <label>
+            <input type="checkbox" name="projectIds" value="${p.gid}">
+            ${p.name} (ID: ${p.gid})
+          </label><br>`
+          )
+          .join("")}
+        <br>
+        <button type="submit">Activate Webhooks</button>
+      </form>
+    `);
   } catch (err) {
     console.error("OAuth error:", err);
     res.status(500).send("Server error exchanging token.");
   }
 });
+
+app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), async (req, res) => {
+  const projectIds = Array.isArray(req.body.projectIds)
+    ? req.body.projectIds
+    : [req.body.projectIds];
+
+  if (!projectIds?.length) {
+    return res.status(400).send("No projects selected.");
+  }
+
+  try {
+    const tokenRecord = await getToken("asana");
+    if (!tokenRecord || !tokenRecord.access_token) {
+      return res.status(400).send("Asana token not found. Please reconnect.");
+    }
+
+    const results = [];
+
+    for (const projectId of projectIds) {
+      const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tokenRecord.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          resource: projectId,
+          target: "https://asana-canto-sync.onrender.com/webhook/asana",
+        }),
+      });
+
+      const data = await response.json();
+      results.push({
+        projectId,
+        success: !data.errors,
+        message: data.errors ? JSON.stringify(data.errors) : "Webhook registered successfully.",
+      });
+    }
+
+    res.send(`
+      <h2>🪝 Webhook Setup Complete</h2>
+      <ul>
+        ${results
+          .map(
+            (r) =>
+              `<li><strong>${r.projectId}</strong>: ${
+                r.success ? "✅ Success" : "❌ Failed"
+              } — ${r.message}</li>`
+          )
+          .join("")}
+      </ul>
+      <p>You can close this window.</p>
+    `);
+  } catch (err) {
+    console.error("Webhook registration error:", err);
+    res.status(500).send("Server error registering webhooks.");
+  }
+});
+
 
 // =========================
 // 🧠 DYNAMIC ASANA WEBHOOK REGISTRATION
