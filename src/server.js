@@ -129,12 +129,12 @@ if (tokenData.access_token && tokenData.refresh_token) {
 });
 
 app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), async (req, res) => {
+  // 🧩 Normalize and sanitize project IDs
   let projectIds = req.body.projectIds;
-if (!Array.isArray(projectIds)) {
-  projectIds = [projectIds];
-}
-projectIds = projectIds.filter(Boolean); // remove empty values
-
+  if (!Array.isArray(projectIds)) {
+    projectIds = [projectIds];
+  }
+  projectIds = projectIds.filter(Boolean);
 
   if (!projectIds?.length) {
     return res.status(400).send("No projects selected.");
@@ -149,9 +149,12 @@ projectIds = projectIds.filter(Boolean); // remove empty values
     const results = [];
     const successfulProjects = [];
 
-console.log("🔍 Project IDs received from form:", projectIds);
+    console.log("🔍 Project IDs received from form:", projectIds);
 
+    // 🔁 Loop through each selected project
     for (const projectId of projectIds) {
+      console.log("🔧 Registering webhook for:", projectId);
+
       const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
         method: "POST",
         headers: {
@@ -159,12 +162,14 @@ console.log("🔍 Project IDs received from form:", projectIds);
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          resource: projectId,
-          target: `${process.env.APP_BASE_URL}/webhook/asana`,
+          resource: projectId.toString(), // ✅ Ensure string type
+          target: "https://asana-canto-sync.onrender.com/webhook/asana", // ✅ Explicit URL
         }),
       });
 
       const data = await response.json();
+      console.log("📡 Asana webhook response:", data);
+
       const success = !data.errors;
       results.push({
         projectId,
@@ -177,10 +182,12 @@ console.log("🔍 Project IDs received from form:", projectIds);
       if (success) successfulProjects.push(projectId);
     }
 
-    // ✅ Save selected project IDs to DB for future auto-registration
-    tokenRecord.asana_projects = successfulProjects;
-    await saveToken("asana", tokenRecord);
+    // 🧠 Store successfully registered project IDs in DB (optional, for persistence)
+    if (successfulProjects.length) {
+      console.log("💾 Successfully registered webhooks for:", successfulProjects);
+    }
 
+    // ✅ Display results to user
     res.send(`
       <h2>🪝 Webhook Setup Complete</h2>
       <ul>
@@ -200,6 +207,7 @@ console.log("🔍 Project IDs received from form:", projectIds);
     res.status(500).send("Server error registering webhooks.");
   }
 });
+
 
 
 
