@@ -94,12 +94,15 @@ app.post("/connect/canto/start", (req, res) => {
 
 // Step 3: Canto OAuth2 Callback → Exchange Code for Token
 app.get("/oauth/callback/canto", async (req, res) => {
+  console.log("🎯 Callback hit with query:", req.query);
+
   const authCode = req.query.code;
   const userDomain = req.query.state;
 
-  if (!authCode || !userDomain)
-    return res.status(400).send("Missing authorization code or domain");
-
+  if (!authCode) {
+    console.log("❌ Missing authorization code. Query:", req.query);
+    return res.status(400).send("Missing authorization code");
+  }
   try {
     const tokenUrl = `https://${userDomain}/oauth2/token`;
 
