@@ -1,118 +1,32 @@
 import express from "express";
-import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { initDB, saveToken, getToken } from "./db.js"; // make sure getToken is imported too!
+import { initDB, saveToken, getToken } from "./db.js";
 
 dotenv.config();
 
-// ✅ Initialize app FIRST
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Temporary in-memory fallback (for dev/testing)
+// Optional in-memory cache (dev convenience)
 const cantoTokens = {};
 
-
-// ✅ Then use middlewares
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
-
-app.get("/oauth/callback/canto", async (req, res) => {
-  const { code, state } = req.query; // state = e.g. "thedamconsultants.canto.com"
-  console.log("🎯 Callback hit with query:", req.query);
-
-  try {
-    // Exchange authorization code for access token
-    const tokenResponse = await fetch("https://oauth.canto.com/oauth/api/oauth2/compatible/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        code,
-        grant_type: "authorization_code",
-        redirect_uri: "https://asana-canto-sync.onrender.com/oauth/callback/canto",
-        app_id: process.env.CANTO_APP_ID,
-        app_secret: process.env.CANTO_APP_SECRET,
-      }),
-    });
-
-    const tokenData = await tokenResponse.json();
-    tokenData.domain = state; // ✅ attach domain
-
-    // Save to DB
-    await saveToken(state, tokenData);
-
-    // Also keep it in memory for quick access (optional)
-    cantoTokens[state] = tokenData;
-
-    console.log("🌍 Saved domain for token:", state);
-    res.send("✅ Canto connection successful. You can close this window.");
-  } catch (err) {
-    console.error("Canto OAuth error:", err);
-    res.status(500).send("OAuth failed");
-  }
-});
-
-app.post("/upload", async (req, res) => {
-  const { attachmentUrl, domain } = req.body;
-
-  // Try to get from DB first, fallback to memory
-  let tokenData = await getToken(domain);
-  if (!tokenData) tokenData = cantoTokens[domain];
-
-  if (!tokenData || !tokenData.domain) {
-    console.error("❌ No valid token found for domain:", domain);
-    return res.status(400).json({ error: "Canto token not found or invalid domain" });
-  }
-
-  const uploadUrl = `https://${tokenData.domain}/api/v1/upload`;
-  console.log("📤 Uploading to:", uploadUrl);
-  console.log("🔑 Using token (first 10 chars):", tokenData.access_token.slice(0, 10));
-
-  try {
-    const response = await fetch(uploadUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        url: attachmentUrl,
-        folder: "asana-sync",
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(errorText);
-    }
-
-    const data = await response.json();
-    res.json({ success: true, data });
-  } catch (err) {
-    console.error("Canto upload error:", err);
-    res.status(500).json({ error: "Error uploading file to Canto" });
-  }
-});
-
-
 // -------------------------
-// Home Route
+// Home
 // -------------------------
 app.get("/", (req, res) => {
   res.send("Asana ↔ Canto Sync Service Running");
 });
 
-
-// =========================
-// 🟣 ASANA AUTH FLOW
-// =========================
+/* ========================
+   ASANA AUTH FLOW
+======================== */
 app.get("/connect/asana", (req, res) => {
-  const authUrl = `https://app.asana.com/-/oauth_authorize?client_id=${process.env.ASANA_CLIENT_ID}&redirect_uri=${encodeURIComponent(
-    process.env.ASANA_REDIRECT_URI
-  )}&response_type=code`;
+  const authUrl =
+    `https://app.asana.com/-/oauth_authorize?client_id=${process.env.ASANA_CLIENT_ID}` +
+    `&redirect_uri=${encodeURIComponent(process.env.ASANA_REDIRECT_URI)}` +
+    `&response_type=code`;
   res.redirect(authUrl);
 });
 
@@ -121,7 +35,6 @@ app.get("/oauth/callback/asana", async (req, res) => {
   if (!authCode) return res.status(400).send("Missing authorization code");
 
   try {
-    // 1️⃣ Exchange code for token
     const tokenResponse = await fetch("https://app.asana.com/-/oauth_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -135,59 +48,54 @@ app.get("/oauth/callback/asana", async (req, res) => {
     });
 
     const tokenData = await tokenResponse.json();
-    if (tokenData.error)
-      return res.status(400).send("Token exchange failed: " + tokenData.error);
+    if (tokenData.error) return res.status(400).send("Token exchange failed: " + tokenData.error);
 
     await saveToken("asana", tokenData);
-// ✅ Automatically re-register stored webhooks for existing projects
-if (tokenData.access_token && tokenData.refresh_token) {
-  try {
-    const storedToken = await getToken("asana");
-    if (storedToken?.asana_projects?.length) {
-      console.log("🔁 Re-registering webhooks for projects:", storedToken.asana_projects);
 
-      for (const projectId of storedToken.asana_projects) {
-        try {
-          const reReg = await fetch("https://app.asana.com/api/1.0/webhooks", {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${tokenData.access_token}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              resource: projectId,
-              target: `${process.env.APP_BASE_URL}/webhook/asana`,
-            }),
-          });
-
-          const reRegData = await reReg.json();
-          if (reRegData.errors) {
-            console.error(`⚠️ Webhook re-registration failed for ${projectId}:`, reRegData.errors);
-          } else {
-            console.log(`✅ Webhook re-registered for project ${projectId}`);
+    // Re-register any stored webhooks (safe no-op if none)
+    if (tokenData.access_token && tokenData.refresh_token) {
+      try {
+        const storedToken = await getToken("asana");
+        if (storedToken?.asana_projects?.length) {
+          console.log("🔁 Re-registering webhooks for projects:", storedToken.asana_projects);
+          for (const projectId of storedToken.asana_projects) {
+            try {
+              const reReg = await fetch("https://app.asana.com/api/1.0/webhooks", {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${tokenData.access_token}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  resource: projectId,
+                  target: `${process.env.APP_BASE_URL}/webhook/asana`,
+                }),
+              });
+              const reRegData = await reReg.json();
+              if (reRegData.errors) {
+                console.error(`⚠️ Webhook re-registration failed for ${projectId}:`, reRegData.errors);
+              } else {
+                console.log(`✅ Webhook re-registered for project ${projectId}`);
+              }
+            } catch (innerErr) {
+              console.error(`❌ Failed webhook re-registration for ${projectId}:`, innerErr);
+            }
           }
-        } catch (innerErr) {
-          console.error(`❌ Failed webhook re-registration for project ${projectId}:`, innerErr);
         }
+      } catch (err) {
+        console.error("Error during webhook auto-re-registration:", err);
       }
     }
-  } catch (err) {
-    console.error("Error during webhook auto-re-registration:", err);
-  }
-}
 
-    // 2️⃣ Fetch all projects
+    // Fetch projects for simple UI
     const projectResponse = await fetch("https://app.asana.com/api/1.0/projects", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
 
     const projectList = await projectResponse.json();
-    if (!projectList.data?.length) {
-      return res.send(`<h2>✅ Asana Connected, but no projects found.</h2>`);
-    }
+    if (!projectList.data?.length) return res.send("<h2>✅ Asana Connected, but no projects found.</h2>");
 
-    // 3️⃣ Show project selection form
-        res.send(`
+    res.send(`
       <h2>✅ Asana Connected!</h2>
       <h3>Select one or more projects to activate webhooks:</h3>
       <form action="/register/asana-webhooks" method="POST">
@@ -210,61 +118,39 @@ if (tokenData.access_token && tokenData.refresh_token) {
   }
 });
 
-app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), async (req, res) => {
+app.post("/register/asana-webhooks", async (req, res) => {
   let projectIds = req.body.projectIds;
-  if (!Array.isArray(projectIds)) {
-    projectIds = [projectIds];
-  }
+  if (!Array.isArray(projectIds)) projectIds = [projectIds];
   projectIds = projectIds.filter(Boolean);
-
-  if (!projectIds?.length) {
-    return res.status(400).send("No projects selected.");
-  }
+  if (!projectIds?.length) return res.status(400).send("No projects selected.");
 
   try {
     const tokenRecord = await getToken("asana");
-    if (!tokenRecord || !tokenRecord.access_token) {
-      return res.status(400).send("Asana token not found. Please reconnect.");
-    }
+    if (!tokenRecord?.access_token) return res.status(400).send("Asana token not found. Please reconnect.");
 
     const results = [];
     const successfulProjects = [];
 
-    console.log("🔍 Project IDs received from form:", projectIds);
-
     for (const projectId of projectIds) {
-      console.log("🔧 Registering webhook for:", projectId);
-
       const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${tokenRecord.access_token}`,
-          "Content-Type": "application/x-www-form-urlencoded", // ✅ Asana expects URL-encoded form data
+          Authorization: `Bearer ${tokenRecord.access_token}`,
+          "Content-Type": "application/json",
         },
-        body: new URLSearchParams({
+        body: JSON.stringify({
           resource: projectId.toString(),
-          target: "https://asana-canto-sync.onrender.com/webhook/asana",
+          target: `${process.env.APP_BASE_URL}/webhook/asana`,
         }),
       });
 
       const data = await response.json();
-      console.log("📡 Asana webhook response:", data);
-
       const success = !data.errors;
-      results.push({
-        projectId,
-        success,
-        message: success
-          ? "Webhook registered successfully."
-          : JSON.stringify(data.errors),
-      });
-
+      results.push({ projectId, success, message: success ? "Webhook registered successfully." : JSON.stringify(data.errors) });
       if (success) successfulProjects.push(projectId);
     }
 
-    if (successfulProjects.length) {
-      console.log("💾 Successfully registered webhooks for:", successfulProjects);
-    }
+    if (successfulProjects.length) console.log("💾 Successfully registered webhooks for:", successfulProjects);
 
     res.send(`
       <h2>🪝 Webhook Setup Complete</h2>
@@ -272,9 +158,7 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
         ${results
           .map(
             (r) =>
-              `<li><strong>${r.projectId}</strong>: ${
-                r.success ? "✅ Success" : "❌ Failed"
-              } — ${r.message}</li>`
+              `<li><strong>${r.projectId}</strong>: ${r.success ? "✅ Success" : "❌ Failed"} — ${r.message}</li>`
           )
           .join("")}
       </ul>
@@ -286,40 +170,26 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
   }
 });
 
-
-
-
-
-// =========================
-// 🧠 DYNAMIC ASANA WEBHOOK REGISTRATION
-// =========================
 app.post("/register/asana-webhook", async (req, res) => {
   const { projectId } = req.body;
-
   try {
     const tokenRecord = await getToken("asana");
-    if (!tokenRecord || !tokenRecord.access_token) {
-      return res.status(400).send("Asana token not found. Please connect Asana first.");
-    }
+    if (!tokenRecord?.access_token) return res.status(400).send("Asana token not found. Please connect Asana first.");
 
     const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${tokenRecord.access_token}`,
+        Authorization: `Bearer ${tokenRecord.access_token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
         resource: projectId,
-        target: "https://asana-canto-sync.onrender.com/webhook/asana",
+        target: `${process.env.APP_BASE_URL}/webhook/asana`,
       }),
     });
 
     const data = await response.json();
-    console.log("🪝 Webhook registration response:", data);
-
-    if (data.errors) {
-      return res.status(400).send("Failed to create webhook: " + JSON.stringify(data.errors));
-    }
+    if (data.errors) return res.status(400).send("Failed to create webhook: " + JSON.stringify(data.errors));
 
     res.send(`<h3>✅ Webhook registered for project ${projectId}</h3>`);
   } catch (err) {
@@ -328,36 +198,20 @@ app.post("/register/asana-webhook", async (req, res) => {
   }
 });
 
-// =========================
-// 📋 LIST ASANA PROJECTS (for multi-tenant selection)
-// =========================
 app.get("/list/asana-projects", async (req, res) => {
   try {
     const tokenRecord = await getToken("asana");
-    if (!tokenRecord || !tokenRecord.access_token) {
-      return res.status(400).send("Asana token not found. Please connect Asana first.");
-    }
+    if (!tokenRecord?.access_token) return res.status(400).send("Asana token not found. Please connect Asana first.");
 
     const response = await fetch("https://app.asana.com/api/1.0/projects", {
       method: "GET",
-      headers: {
-        "Authorization": `Bearer ${tokenRecord.access_token}`,
-      },
+      headers: { Authorization: `Bearer ${tokenRecord.access_token}` },
     });
 
     const data = await response.json();
-    if (data.errors) {
-      console.error("❌ Asana API error:", data.errors);
-      return res.status(400).send("Error fetching projects: " + JSON.stringify(data.errors));
-    }
+    if (data.errors) return res.status(400).send("Error fetching projects: " + JSON.stringify(data.errors));
 
-    const projects = data.data.map((p) => ({
-      id: p.gid,
-      name: p.name,
-    }));
-
-    console.log("📋 Projects fetched:", projects);
-
+    const projects = data.data.map((p) => ({ id: p.gid, name: p.name }));
     res.send(`
       <h2>🗂️ Your Asana Projects</h2>
       <ul>
@@ -371,12 +225,11 @@ app.get("/list/asana-projects", async (req, res) => {
   }
 });
 
+/* ========================
+   CANTO OAUTH (COMPATIBLE)
+======================== */
 
-// =========================
-// ✅ CANTO OAUTH2 (COMPATIBLE ENDPOINT)
-// =========================
-
-// Step 1: Show domain entry UI
+// Step 1: simple domain form
 app.get("/connect/canto", (req, res) => {
   res.send(`
     <h1>Connect to Canto</h1>
@@ -388,90 +241,133 @@ app.get("/connect/canto", (req, res) => {
   `);
 });
 
-// Step 2: Redirect user to Canto OAuth2 (compatible endpoint)
+// Step 2: redirect to Canto authorize
 app.post("/connect/canto/start", (req, res) => {
-  const userDomain = req.body.domain.trim().replace(/^https?:\/\//, "");
+  const userDomain = String(req.body.domain || "")
+    .trim()
+    .replace(/^https?:\/\//, "");
   console.log("🌍 Starting Canto OAuth for domain:", userDomain);
 
   const authUrl =
     "https://oauth.canto.com/oauth/api/oauth2/compatible/authorize?" +
     new URLSearchParams({
       response_type: "code",
-      app_id: process.env.CANTO_CLIENT_ID,
-      redirect_uri: process.env.CANTO_REDIRECT_URI,
-      state: userDomain, // ✅ Pass domain here
+      app_id: process.env.CANTO_APP_ID,              // <— standardized
+      redirect_uri: process.env.CANTO_REDIRECT_URI,  // <— standardized
+      state: userDomain,                              // carry tenant domain
     });
 
   res.redirect(authUrl);
 });
 
-
-// Step 3: Canto Callback → Exchange Code for Token
+// Step 3: callback — exchange code for token (SINGLE VERSION)
 app.get("/oauth/callback/canto", async (req, res) => {
+  const { code, state } = req.query; // state === domain (e.g., "thedamconsultants.canto.com")
   console.log("🎯 Callback hit with query:", req.query);
 
-  const authCode = req.query.code;
-  const userDomain = req.query.state; // ✅ this captures the domain we passed in `state`
-  if (!authCode || !userDomain)
-    return res.status(400).send("Missing authorization code or domain");
+  if (!code || !state) return res.status(400).send("Missing authorization code or domain");
 
   try {
     const tokenUrl = "https://oauth.canto.com/oauth/api/oauth2/compatible/token";
-
     const response = await fetch(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
-        app_id: process.env.CANTO_CLIENT_ID,
-        app_secret: process.env.CANTO_CLIENT_SECRET,
+        app_id: process.env.CANTO_APP_ID,
+        app_secret: process.env.CANTO_APP_SECRET,
         redirect_uri: process.env.CANTO_REDIRECT_URI,
-        code: authCode,
+        code,
       }),
     });
 
-    const tokenData = await response.json();
-    console.log("🔐 Token exchange response:", tokenData);
+    const raw = await response.text();
+    console.log("🔍 Raw token response:", raw);
 
-    if (tokenData.error)
-      return res.status(400).send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
+    let tokenData;
+    try {
+      tokenData = JSON.parse(raw);
+    } catch {
+      return res.status(400).send("Canto token response was not JSON (check app id/secret/redirect uri).");
+    }
 
-    // ✅ Add these two lines here
-    tokenData.domain = userDomain;
-    console.log("🌍 Saved domain for token:", userDomain);
+    if (tokenData.error) {
+      return res
+        .status(400)
+        .send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
+    }
 
-    await saveToken("canto", tokenData);
+    tokenData.domain = state;
+    cantoTokens[state] = tokenData;                // optional cache
+    await saveToken(state, tokenData);             // persist by domain key
+    console.log("🌍 Saved domain for token:", state);
 
-    res.send(`<h2>✅ Canto Connected for <strong>${userDomain}</strong>!</h2>
-              <p>You can close this window.</p>`);
+    res.send(`<h2>✅ Canto Connected for <strong>${state}</strong>!</h2><p>You can close this window.</p>`);
   } catch (err) {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
   }
 });
 
+/* ========================
+   UPLOAD TO CANTO
+======================== */
 
-// =========================
-// 🔔 ASANA WEBHOOK HANDLER
-// =========================
-app.post("/webhook/asana", (req, res) => {
-  const challenge = req.headers["x-hook-secret"];
-  if (challenge) {
-    console.log("✅ Asana webhook verified");
-    res.setHeader("X-Hook-Secret", challenge);
-    return res.status(200).send();
+app.post("/upload", async (req, res) => {
+  const { attachmentUrl, domain, folder = "asana-sync" } = req.body;
+
+  if (!domain) return res.status(400).json({ error: "Missing domain" });
+  if (!attachmentUrl) return res.status(400).json({ error: "Missing attachmentUrl" });
+
+  // DB first, fallback to memory
+  let tokenData = await getToken(domain);
+  if (!tokenData) tokenData = cantoTokens[domain];
+
+  if (!tokenData?.access_token || !tokenData?.domain) {
+    console.error("❌ No valid token found for domain:", domain);
+    return res.status(400).json({ error: "Canto token not found or invalid for this domain" });
   }
 
-  console.log("📩 Asana webhook event:", JSON.stringify(req.body, null, 2));
-  res.status(200).send("OK");
+  const uploadUrl = `https://${tokenData.domain}/api/v1/upload`;
+  console.log("📤 Uploading to:", uploadUrl);
+  console.log("🔑 Using token (first 10 chars):", tokenData.access_token.slice(0, 10));
+
+  try {
+    // If your Canto expects a URL-based upload:
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ url: attachmentUrl, folder }),
+    });
+
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    if (!response.ok) {
+      console.error("Canto upload error payload:", data);
+      return res.status(400).json({ error: "Error uploading file to Canto", details: data });
+    }
+
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("Canto upload error:", err);
+    res.status(500).json({ error: "Error uploading file to Canto" });
+  }
 });
 
+// Simple manual test route (JSON body)
 app.post("/test/upload-canto", async (req, res) => {
+  const { domain, sourceUrl, folder = "asana-sync" } = req.body;
+  if (!domain || !sourceUrl) return res.status(400).send("Provide domain and sourceUrl");
+
   try {
-    const tokenRecord = await getToken("canto");
-    if (!tokenRecord || !tokenRecord.access_token) {
-      return res.status(400).send("Canto token not found. Please reconnect Canto first.");
-    }
+    let tokenRecord = await getToken(domain);
+    if (!tokenRecord) tokenRecord = cantoTokens[domain];
+    if (!tokenRecord?.access_token) return res.status(400).send("Canto token not found. Please reconnect Canto first.");
 
     const uploadUrl = `https://${tokenRecord.domain}/api/v1/upload`;
     console.log("📤 Uploading to:", uploadUrl);
@@ -479,21 +375,13 @@ app.post("/test/upload-canto", async (req, res) => {
 
     const response = await fetch(uploadUrl, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokenRecord.access_token}`,
-      },
-      body: req, // Pass raw incoming stream from Postman
+      headers: { Authorization: `Bearer ${tokenRecord.access_token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ url: sourceUrl, folder }),
     });
 
     const text = await response.text();
-    console.log("📩 Raw response from Canto:", text);
-
     let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { raw: text };
-    }
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
     if (response.ok) {
       res.send(`<h2>✅ File uploaded to Canto!</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
@@ -506,11 +394,23 @@ app.post("/test/upload-canto", async (req, res) => {
   }
 });
 
+/* ========================
+   ASANA WEBHOOK HANDLER
+======================== */
+app.post("/webhook/asana", (req, res) => {
+  const challenge = req.headers["x-hook-secret"];
+  if (challenge) {
+    console.log("✅ Asana webhook verified");
+    res.setHeader("X-Hook-Secret", challenge);
+    return res.status(200).send();
+  }
+  console.log("📩 Asana webhook event:", JSON.stringify(req.body, null, 2));
+  res.status(200).send("OK");
+});
 
-
-// =========================
-// 🚀 START SERVER
-// =========================
+/* ========================
+   START
+======================== */
 const port = process.env.PORT || 3000;
 initDB().then(() => {
   app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
