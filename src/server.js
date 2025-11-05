@@ -346,7 +346,12 @@ app.get("/oauth/callback/canto", async (req, res) => {
     console.log("🔐 Token exchange response:", tokenData);
 
     if (tokenData.error)
-      return res.status(400).send("Token exchange failed: " + tokenData.error_description || tokenData.error);
+      return res
+        .status(400)
+        .send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
+
+    // ✅ Save the user's domain — this is critical for uploads
+    tokenData.domain = "thedamconsultants.canto.com";
 
     await saveToken("canto", tokenData);
 
