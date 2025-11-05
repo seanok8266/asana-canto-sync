@@ -89,6 +89,7 @@ app.post("/connect/canto/start", (req, res) => {
       scope: "openapi"
     });
 
+      console.log("Redirecting user to:", authUrl);
   res.redirect(authUrl);
 });
 
