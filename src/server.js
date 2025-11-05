@@ -73,7 +73,7 @@ app.get("/connect/canto", (req, res) => {
   `);
 });
 
-// Step 2: Redirect to *tenant-specific* OAuth authorize endpoint
+// Step 2: Redirect to *tenant-specific* OAuth authorize endpoint (with state)
 app.post("/connect/canto/start", (req, res) => {
   const userDomain = req.body.domain.trim(); // e.g., thedamconsultants.canto.com
 
@@ -84,6 +84,7 @@ app.post("/connect/canto/start", (req, res) => {
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
       scope: "openapi",
+      state: userDomain // ✅ send domain through OAuth round trip
     });
 
   res.redirect(authUrl);
