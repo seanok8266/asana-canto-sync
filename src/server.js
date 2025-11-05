@@ -125,6 +125,21 @@ app.get("/oauth/callback/canto", async (req, res) => {
   }
 });
 
+// =========================
+// 🔔 ASANA WEBHOOK HANDLER
+// =========================
+app.post("/webhook/asana", (req, res) => {
+  const challenge = req.headers["x-hook-secret"];
+  if (challenge) {
+    console.log("✅ Asana webhook verified");
+    res.setHeader("X-Hook-Secret", challenge);
+    return res.status(200).send();
+  }
+
+  console.log("📩 Asana webhook event:", JSON.stringify(req.body, null, 2));
+  res.status(200).send("OK");
+});
+
 
 // =========================
 // 🚀 START SERVER
