@@ -2,7 +2,8 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
-import { initDB, saveToken } from "./db.js";
+import { initDB, saveToken, getToken } from "./db.js";
+
 
 dotenv.config();
 const app = express();
