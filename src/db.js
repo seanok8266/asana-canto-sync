@@ -3,38 +3,50 @@ const { Pool } = pkg;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
+// Initialize table
 export async function initDB() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS asana_tokens (
-      user_id TEXT PRIMARY KEY,
-      access_token TEXT NOT NULL,
+    CREATE TABLE IF NOT EXISTS tokens (
+      service TEXT PRIMARY KEY,
+      access_token TEXT,
       refresh_token TEXT,
-      expires_at TIMESTAMP
+      expires_in INTEGER,
+      token_type TEXT
     );
   `);
-  console.log("✅ Database ready");
 }
 
-export async function saveToken(tokenData) {
-  const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000);
-
+// Save token for a service ("asana" or "canto")
+export async function saveToken(service, tokenData) {
   await pool.query(
-    `INSERT INTO asana_tokens (user_id, access_token, refresh_token, expires_at)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (user_id)
-     DO UPDATE SET access_token = $2, refresh_token = $3, expires_at = $4`,
+    `
+      INSERT INTO tokens (service, access_token, refresh_token, expires_in, token_type)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (service) DO UPDATE SET
+        access_token = EXCLUDED.access_token,
+        refresh_token = EXCLUDED.refresh_token,
+        expires_in = EXCLUDED.expires_in,
+        token_type = EXCLUDED.token_type;
+    `,
     [
-      tokenData.data.gid,
+      service,
       tokenData.access_token,
       tokenData.refresh_token,
-      expiresAt
+      tokenData.expires_in || null,
+      tokenData.token_type || "bearer",
     ]
   );
-
-  console.log("💾 Token saved for user:", tokenData.data.gid);
 }
 
-export default pool;
+// ✅ This is what server.js needs
+export async function getToken(service) {
+  const result = await pool.query(
+    `SELECT access_token, refresh_token, expires_in, token_type FROM tokens WHERE service = $1 LIMIT 1`,
+    [service]
+  );
+  return result.rows[0] || null;
+}
+
