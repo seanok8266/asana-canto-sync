@@ -35,6 +35,7 @@ app.get("/oauth/callback/asana", async (req, res) => {
   if (!authCode) return res.status(400).send("Missing authorization code");
 
   try {
+    
     const tokenResponse = await fetch("https://oauth.canto.com/oauth/api/oauth2/compatible/token", {
   method: "POST",
   headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -270,9 +271,17 @@ app.get("/oauth/callback/canto", async (req, res) => {
   }
 
   try {
-    // 🔹 Use the user's domain for the token exchange, not hard-coded oauth.canto.com
-   const tokenUrl = "https://oauth.canto.com/oauth/api/oauth2/compatible/token";
-console.log("🧩 Exchanging token at:", tokenUrl);
+    const tokenUrl = "https://oauth.canto.com/oauth/api/oauth2/compatible/token";
+    console.log("🧩 Exchanging token at:", tokenUrl);
+
+    // ✅ ADD THIS: log exactly what envs we’re sending (mask secret)
+    console.log("🪪 Using Canto creds + redirect:", {
+      app_id: process.env.CANTO_APP_ID,
+      app_secret: process.env.CANTO_APP_SECRET ? "****" : "(missing)",
+      redirect_uri: process.env.CANTO_REDIRECT_URI,
+      state, // tenant domain
+    });
+
     const response = await fetch(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -280,8 +289,8 @@ console.log("🧩 Exchanging token at:", tokenUrl);
         grant_type: "authorization_code",
         app_id: process.env.CANTO_APP_ID,
         app_secret: process.env.CANTO_APP_SECRET,
-        redirect_uri: process.env.CANTO_REDIRECT_URI,
-        code,
+        redirect_uri: process.env.CANTO_REDIRECT_URI, // must EXACT-match the app’s registered redirect
+        code, // from req.query
       }),
     });
 
@@ -299,7 +308,6 @@ console.log("🧩 Exchanging token at:", tokenUrl);
       return res.status(400).send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
     }
 
-    // ✅ Store the domain with the token
     tokenData.domain = state;
     await saveToken(state, tokenData);
 
@@ -310,6 +318,7 @@ console.log("🧩 Exchanging token at:", tokenUrl);
     res.status(500).send("Server error exchanging Canto token.");
   }
 });
+
 
 
 /* ========================
