@@ -77,15 +77,16 @@ app.get("/connect/canto", (req, res) => {
 app.post("/connect/canto/start", (req, res) => {
   const userDomain = req.body.domain.trim();
 
-  const authUrl =
-    "https://oauth.canto.com/oauth/authorize?" +
-    new URLSearchParams({
-      client_id: process.env.CANTO_CLIENT_ID,
-      redirect_uri: process.env.CANTO_REDIRECT_URI,
-      response_type: "code",
-      scope: "openapi",
-      state: userDomain // ✅ Store domain temporarily
-    });
+const authUrl =
+  "https://oauth.canto.com/oauth/authorize?" +
+  new URLSearchParams({
+    client_id: process.env.CANTO_CLIENT_ID,
+    redirect_uri: process.env.CANTO_REDIRECT_URI,
+    response_type: "code",
+    scope: "openapi",
+    account_domain: userDomain, // ✅ REQUIRED FOR THE CORRECT LOGIN SCREEN
+    state: userDomain // ✅ Still keep to save domain later
+  });
 
   res.redirect(authUrl);
 });
