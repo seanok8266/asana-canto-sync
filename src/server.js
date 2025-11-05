@@ -56,6 +56,44 @@ app.get("/oauth/callback/asana", async (req, res) => {
   }
 });
 
+// =========================
+// 🧠 DYNAMIC ASANA WEBHOOK REGISTRATION
+// =========================
+app.post("/register/asana-webhook", async (req, res) => {
+  const { projectId } = req.body;
+
+  try {
+    const tokenRecord = await getToken("asana");
+    if (!tokenRecord || !tokenRecord.access_token) {
+      return res.status(400).send("Asana token not found. Please connect Asana first.");
+    }
+
+    const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${tokenRecord.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        resource: projectId,
+        target: "https://asana-canto-sync.onrender.com/webhook/asana",
+      }),
+    });
+
+    const data = await response.json();
+    console.log("🪝 Webhook registration response:", data);
+
+    if (data.errors) {
+      return res.status(400).send("Failed to create webhook: " + JSON.stringify(data.errors));
+    }
+
+    res.send(`<h3>✅ Webhook registered for project ${projectId}</h3>`);
+  } catch (err) {
+    console.error("Webhook registration error:", err);
+    res.status(500).send("Server error registering webhook.");
+  }
+});
+
 
 // =========================
 // ✅ CANTO OAUTH2 (COMPATIBLE ENDPOINT)
