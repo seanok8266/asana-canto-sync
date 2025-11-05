@@ -4,6 +4,9 @@ import dotenv from "dotenv";
 import fetch from "node-fetch";
 import { initDB, saveToken, getToken } from "./db.js";
 
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
 
 dotenv.config();
 const app = express();
@@ -123,9 +126,12 @@ if (tokenData.access_token && tokenData.refresh_token) {
 });
 
 app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), async (req, res) => {
-  const projectIds = Array.isArray(req.body.projectIds)
-    ? req.body.projectIds
-    : [req.body.projectIds];
+  let projectIds = req.body.projectIds;
+if (!Array.isArray(projectIds)) {
+  projectIds = [projectIds];
+}
+projectIds = projectIds.filter(Boolean); // remove empty values
+
 
   if (!projectIds?.length) {
     return res.status(400).send("No projects selected.");
@@ -139,6 +145,8 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
 
     const results = [];
     const successfulProjects = [];
+
+console.log("🔍 Project IDs received from form:", projectIds);
 
     for (const projectId of projectIds) {
       const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
