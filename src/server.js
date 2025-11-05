@@ -372,47 +372,39 @@ app.post("/upload", async (req, res) => {
 });
 
 // Simple manual test route (JSON body)
+import Busboy from "busboy";
+import fs from "fs";
+
 app.post("/test/upload-canto", async (req, res) => {
-  try {
-    const tokenRecord = await getToken("canto");
-    if (!tokenRecord || !tokenRecord.access_token) {
-      return res.status(400).send("Canto token not found. Please reconnect Canto first.");
-    }
+  const tokenRecord = await getToken("canto");
+  if (!tokenRecord || !tokenRecord.access_token) {
+    return res.status(400).send("Canto token not found. Please reconnect Canto first.");
+  }
 
-    const busboy = (await import("busboy")).default({ headers: req.headers });
-    let fileBuffer, fileName, domain;
+  const uploadUrl = `https://${tokenRecord.domain}/api/v1/files`;
+  console.log("📤 Uploading to:", uploadUrl);
 
-    req.pipe(busboy);
+  const busboy = Busboy({ headers: req.headers });
+  let uploadPromise;
 
-    busboy.on("file", (name, file, info) => {
-      fileName = info.filename;
-      const chunks = [];
-      file.on("data", (data) => chunks.push(data));
-      file.on("end", () => (fileBuffer = Buffer.concat(chunks)));
+  busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
+    console.log("📦 Uploading file:", filename);
+
+    const form = new FormData();
+    form.append("file", file, filename);
+
+    uploadPromise = fetch(uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${tokenRecord.access_token}`,
+      },
+      body: form,
     });
+  });
 
-    busboy.on("field", (name, val) => {
-      if (name === "domain") domain = val.trim();
-    });
-
-    busboy.on("finish", async () => {
-      if (!domain) {
-        return res.status(400).send("Missing domain field.");
-      }
-      if (!fileBuffer) {
-        return res.status(400).send("No file uploaded.");
-      }
-
-      const uploadUrl = `https://${domain}/api/v1/upload`;
-      console.log("📤 Uploading to:", uploadUrl);
-      console.log("🔑 Using token (first 10 chars):", tokenRecord.access_token.slice(0, 10) + "...");
-
-      const response = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${tokenRecord.access_token}` },
-        body: fileBuffer,
-      });
-
+  busboy.on("finish", async () => {
+    try {
+      const response = await uploadPromise;
       const text = await response.text();
       console.log("📩 Raw response from Canto:", text);
 
@@ -424,16 +416,19 @@ app.post("/test/upload-canto", async (req, res) => {
       }
 
       if (response.ok) {
-        res.json({ success: true, file: fileName, data });
+        res.json({ success: true, data });
       } else {
-        res.status(400).json({ success: false, file: fileName, error: data });
+        res.status(400).json({ error: data });
       }
-    });
-  } catch (err) {
-    console.error("Canto upload error:", err);
-    res.status(500).send("Error uploading file to Canto.");
-  }
+    } catch (err) {
+      console.error("Canto upload error:", err);
+      res.status(500).send("Error uploading file to Canto.");
+    }
+  });
+
+  req.pipe(busboy);
 });
+
 
 
 /* ========================
