@@ -75,7 +75,7 @@ app.get("/connect/canto", (req, res) => {
 
 // Step 2: Redirect user to Canto OAuth
 app.post("/connect/canto/start", (req, res) => {
-  const userDomain = req.body.domain.trim();
+  const userDomain = req.body.domain.trim(); // e.g. thedamconsultants.canto.com
 
   const authUrl =
     "https://oauth.canto.com/oauth/authorize?" +
@@ -84,16 +84,16 @@ app.post("/connect/canto/start", (req, res) => {
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
       scope: "openapi",
-      state: userDomain   // ✅ Send domain through OAuth state
+      account_domain: userDomain // ✅ REQUIRED for multi-tenant
     });
 
   res.redirect(authUrl);
 });
 
-// Step 3: OAuth callback → Exchange Code
+// Step 3: OAuth callback
 app.get("/oauth/callback/canto", async (req, res) => {
   const authCode = req.query.code;
-  const userDomain = req.query.state; // ✅ Domain recovered here
+  const userDomain = req.query.account_domain; // ✅ Comes back from Canto
 
   if (!authCode || !userDomain)
     return res.status(400).send("Missing authorization code or domain");
@@ -107,7 +107,8 @@ app.get("/oauth/callback/canto", async (req, res) => {
         client_id: process.env.CANTO_CLIENT_ID,
         client_secret: process.env.CANTO_CLIENT_SECRET,
         redirect_uri: process.env.CANTO_REDIRECT_URI,
-        code: authCode
+        code: authCode,
+        account_domain: userDomain // ✅ Must be included again
       }),
     });
 
@@ -115,16 +116,16 @@ app.get("/oauth/callback/canto", async (req, res) => {
     if (tokenData.error)
       return res.status(400).send("Token exchange failed: " + tokenData.error);
 
-    tokenData.domain = userDomain; // ✅ Store domain for API calls
+    tokenData.domain = userDomain;
     await saveToken("canto", tokenData);
 
-    res.send(`<h2>✅ Canto Connected for <strong>${userDomain}</strong>!</h2>
-              <p>You can close this window.</p>`);
+    res.send(`<h2>✅ Canto Connected for ${userDomain}!</h2>`);
   } catch (err) {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
   }
 });
+
 
 
 // =========================
