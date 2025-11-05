@@ -75,16 +75,18 @@ app.get("/connect/canto", (req, res) => {
 
 // Step 2: Redirect user to Canto OAuth
 app.post("/connect/canto/start", (req, res) => {
-  const userDomain = req.body.domain.trim(); // e.g. thedamconsultants.canto.com
+  let userDomain = req.body.domain.trim(); // ex: thedamconsultants.canto.com
+
+  // Ensure no protocol in domain
+  userDomain = userDomain.replace(/^https?:\/\//, "");
 
   const authUrl =
-    "https://oauth.canto.com/oauth/authorize?" +
+    `https://${userDomain}/oauth/authorize?` +
     new URLSearchParams({
       client_id: process.env.CANTO_CLIENT_ID,
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
-      scope: "openapi",
-      account_domain: userDomain // ✅ REQUIRED for multi-tenant
+      scope: "openapi"
     });
 
   res.redirect(authUrl);
