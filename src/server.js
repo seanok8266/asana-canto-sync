@@ -77,7 +77,8 @@ app.get("/connect/canto", (req, res) => {
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
       scope: "openapi",
-      prompt: "consent", // ✅ Forces popup + permission screen
+      prompt: "consent",
+      account_domain: process.env.CANTO_DOMAIN // ✅ This is the key
     });
 
   res.redirect(authUrl);
@@ -119,7 +120,7 @@ app.get("/oauth/callback/canto", async (req, res) => {
 });
 
 
-// =========================
+// =========================    `   `   `   `   `   `   `   `   `   `   `   `   `   ` 
 // Start Server
 // =========================
 const port = process.env.PORT || 3000;
