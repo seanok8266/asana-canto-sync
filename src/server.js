@@ -73,18 +73,18 @@ app.get("/connect/canto", (req, res) => {
   `);
 });
 
-// Step 2: Redirect to *tenant-specific* OAuth authorize endpoint (with state)
+// Step 2: Redirect user to Canto OAuth
 app.post("/connect/canto/start", (req, res) => {
-  const userDomain = req.body.domain.trim(); // e.g., thedamconsultants.canto.com
+  const userDomain = req.body.domain.trim();
 
   const authUrl =
-    `https://${userDomain}/oauth/authorize?` +
+    "https://oauth.canto.com/oauth/authorize?" +
     new URLSearchParams({
       client_id: process.env.CANTO_CLIENT_ID,
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
       scope: "openapi",
-      state: userDomain // ✅ send domain through OAuth round trip
+      state: userDomain, // ✅ Save domain in OAuth state
     });
 
   res.redirect(authUrl);
@@ -93,15 +93,13 @@ app.post("/connect/canto/start", (req, res) => {
 // Step 3: OAuth callback → exchange token (also tenant-specific)
 app.get("/oauth/callback/canto", async (req, res) => {
   const authCode = req.query.code;
+  const userDomain = req.query.state; // ✅ multi-tenant domain passed back
 
-  // We retrieve the original tenant domain from the redirect URI query parameter
-  // Canto appends ?state=domain if we use state — so let's do that
-  const userDomain = req.query.state;
   if (!authCode || !userDomain)
     return res.status(400).send("Missing authorization code or domain");
 
   try {
-    const response = await fetch(`https://${userDomain}/oauth/token`, {
+    const response = await fetch("https://oauth.canto.com/oauth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -110,6 +108,7 @@ app.get("/oauth/callback/canto", async (req, res) => {
         client_secret: process.env.CANTO_CLIENT_SECRET,
         redirect_uri: process.env.CANTO_REDIRECT_URI,
         code: authCode,
+        account_domain: userDomain, // ✅ Required here (but not in authorize step)
       }),
     });
 
@@ -117,10 +116,10 @@ app.get("/oauth/callback/canto", async (req, res) => {
     if (tokenData.error)
       return res.status(400).send("Token exchange failed: " + tokenData.error);
 
-    tokenData.domain = userDomain; // ✅ store the tenant domain for future API calls
+    tokenData.domain = userDomain;
     await saveToken("canto", tokenData);
 
-    res.send(`<h2>✅ Canto Connected for <strong>${userDomain}</strong>!</h2>`);
+    res.send(`<h2>✅ Canto Connected for ${userDomain}!</h2>`);
   } catch (err) {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
