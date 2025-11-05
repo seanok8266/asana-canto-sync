@@ -374,7 +374,7 @@ app.post("/upload", async (req, res) => {
 // Simple manual test route (JSON body)
 import Busboy from "busboy";
 import { Buffer } from "buffer";
-
+import FormData from "form-data";
 
 app.post("/test/upload-canto", async (req, res) => {
   const busboy = Busboy({ headers: req.headers });
@@ -405,7 +405,7 @@ app.post("/test/upload-canto", async (req, res) => {
       return res.status(400).send("Canto token not found for this domain.");
     }
 
-  const uploadUrl = `https://${domain}/api/v1/import/upload`;
+    const uploadUrl = `https://${domain}/api/v1/files`;
     console.log("📤 Uploading to:", uploadUrl);
 
     try {
@@ -443,6 +443,7 @@ app.post("/test/upload-canto", async (req, res) => {
 
   req.pipe(busboy);
 });
+
 
 
 
