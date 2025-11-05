@@ -35,17 +35,17 @@ app.get("/oauth/callback/asana", async (req, res) => {
   if (!authCode) return res.status(400).send("Missing authorization code");
 
   try {
-    const tokenResponse = await fetch("https://app.asana.com/-/oauth_token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: process.env.ASANA_CLIENT_ID,
-        client_secret: process.env.ASANA_CLIENT_SECRET,
-        redirect_uri: process.env.ASANA_REDIRECT_URI,
-        code: authCode,
-      }),
-    });
+    const tokenResponse = await fetch("https://oauth.canto.com/oauth/api/oauth2/compatible/token", {
+  method: "POST",
+  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  body: new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: "https://asana-canto-sync.onrender.com/oauth/callback/canto",
+    app_id: process.env.CANTO_APP_ID,
+    app_secret: process.env.CANTO_APP_SECRET,
+  }),
+});
 
     const tokenData = await tokenResponse.json();
     if (tokenData.error) return res.status(400).send("Token exchange failed: " + tokenData.error);
