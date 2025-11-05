@@ -373,8 +373,9 @@ app.post("/upload", async (req, res) => {
 
 // Simple manual test route (JSON body)
 import Busboy from "busboy";
-import { Buffer } from "buffer";
 import FormData from "form-data";
+import { Buffer } from "buffer";
+import { getToken } from "./db.js";
 
 app.post("/test/upload-canto", async (req, res) => {
   const busboy = Busboy({ headers: req.headers });
@@ -401,28 +402,12 @@ app.post("/test/upload-canto", async (req, res) => {
     if (!fileBuffer) return res.status(400).send("No file received.");
 
     const tokenRecord = await getToken(domain);
-    if (!tokenRecord?.access_token) {
+    if (!tokenRecord || !tokenRecord.access_token) {
       return res.status(400).send("Canto token not found for this domain.");
     }
 
-    let apiBase = null;
-    try {
-      console.log(`🌍 Checking API base for ${domain}...`);
-      const infoRes = await fetch(`https://${domain}/api/v1/info`, {
-        headers: { Authorization: `Bearer ${tokenRecord.access_token}` },
-      });
-      const infoText = await infoRes.text();
-      console.log("ℹ️ /info raw:", infoText.slice(0, 300));
-
-      const info = JSON.parse(infoText);
-      apiBase = info?.api_base_url || info?.upload_url || info?.urls?.upload;
-    } catch (err) {
-      console.warn("⚠️ Failed to get /api/v1/info:", err);
-    }
-
-    // ✅ Pick fallback if none found
-    const uploadUrl =
-      apiBase?.includes("http") ? `${apiBase}/api/v1/upload` : `https://api.canto.com/api/v1/upload`;
+    // ✅ Correct upload URL
+    const uploadUrl = `https://${domain}/rest/asset/upload`;
 
     console.log("📤 Uploading to:", uploadUrl);
 
@@ -440,7 +425,7 @@ app.post("/test/upload-canto", async (req, res) => {
       });
 
       const text = await response.text();
-      console.log("📩 Raw response from Canto:", text.slice(0, 400));
+      console.log("📩 Raw response from Canto:", text);
 
       let data;
       try {
@@ -455,7 +440,7 @@ app.post("/test/upload-canto", async (req, res) => {
         res.status(400).json({ error: data });
       }
     } catch (err) {
-      console.error("❌ Canto upload error:", err);
+      console.error("Canto upload error:", err);
       res.status(500).send("Error uploading file to Canto.");
     }
   });
