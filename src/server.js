@@ -262,13 +262,17 @@ app.post("/connect/canto/start", (req, res) => {
 
 // Step 3: callback — exchange code for token (SINGLE VERSION)
 app.get("/oauth/callback/canto", async (req, res) => {
-  const { code, state } = req.query; // state === domain (e.g., "thedamconsultants.canto.com")
+  const { code, state } = req.query; // state = user's Canto domain (e.g. acme.canto.com)
   console.log("🎯 Callback hit with query:", req.query);
 
-  if (!code || !state) return res.status(400).send("Missing authorization code or domain");
+  if (!code || !state) {
+    return res.status(400).send("Missing authorization code or domain");
+  }
 
   try {
-    const tokenUrl = "https://oauth.canto.com/oauth/api/oauth2/compatible/token";
+    // 🔹 Use the user's domain for the token exchange, not hard-coded oauth.canto.com
+    const tokenUrl = `https://${state}/oauth/api/oauth2/compatible/token`;
+
     const response = await fetch(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -288,26 +292,25 @@ app.get("/oauth/callback/canto", async (req, res) => {
     try {
       tokenData = JSON.parse(raw);
     } catch {
-      return res.status(400).send("Canto token response was not JSON (check app id/secret/redirect uri).");
+      return res.status(400).send("Canto token response was not JSON — check credentials or domain.");
     }
 
     if (tokenData.error) {
-      return res
-        .status(400)
-        .send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
+      return res.status(400).send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
     }
 
+    // ✅ Store the domain with the token
     tokenData.domain = state;
-    cantoTokens[state] = tokenData;                // optional cache
-    await saveToken(state, tokenData);             // persist by domain key
-    console.log("🌍 Saved domain for token:", state);
+    await saveToken(state, tokenData);
 
+    console.log("🌍 Saved token for domain:", state);
     res.send(`<h2>✅ Canto Connected for <strong>${state}</strong>!</h2><p>You can close this window.</p>`);
   } catch (err) {
     console.error("Canto OAuth error:", err);
     res.status(500).send("Server error exchanging Canto token.");
   }
 });
+
 
 /* ========================
    UPLOAD TO CANTO
