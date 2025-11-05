@@ -389,7 +389,6 @@ app.post("/test/upload-canto", async (req, res) => {
     fileName = info.filename;
     mimeType = info.mimeType;
     console.log("📦 Uploading file:", info);
-
     file.on("data", (data) => chunks.push(data));
     file.on("end", () => {
       fileBuffer = Buffer.concat(chunks);
@@ -410,12 +409,13 @@ app.post("/test/upload-canto", async (req, res) => {
 
     try {
       const form = new FormData();
-      form.append("file", new Blob([fileBuffer], { type: mimeType }), fileName);
+      form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
 
       const response = await fetch(uploadUrl, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${tokenRecord.access_token}`,
+          ...form.getHeaders(),
         },
         body: form,
       });
@@ -436,13 +436,14 @@ app.post("/test/upload-canto", async (req, res) => {
         res.status(400).json({ error: data });
       }
     } catch (err) {
-      console.error("Canto upload error:", err);
+      console.error("❌ Canto upload error:", err);
       res.status(500).send("Error uploading file to Canto.");
     }
   });
 
   req.pipe(busboy);
 });
+
 
 
 
