@@ -75,7 +75,7 @@ app.get("/connect/canto", (req, res) => {
 
 // Step 2: Redirect user to Canto OAuth
 app.post("/connect/canto/start", (req, res) => {
-  const userDomain = req.body.domain.trim();
+  const userDomain = req.body.domain.trim(); // ex: thedamconsultants.canto.com
 
   const authUrl =
     "https://oauth.canto.com/oauth/authorize?" +
@@ -84,7 +84,8 @@ app.post("/connect/canto/start", (req, res) => {
       redirect_uri: process.env.CANTO_REDIRECT_URI,
       response_type: "code",
       scope: "openapi",
-      state: userDomain, // ✅ Save domain in OAuth state
+      account_domain: userDomain, // ✅ REQUIRED for login
+      state: userDomain,          // ✅ So we get domain back later
     });
 
   res.redirect(authUrl);
@@ -93,7 +94,7 @@ app.post("/connect/canto/start", (req, res) => {
 // Step 3: OAuth callback → exchange token (also tenant-specific)
 app.get("/oauth/callback/canto", async (req, res) => {
   const authCode = req.query.code;
-  const userDomain = req.query.state; // ✅ multi-tenant domain passed back
+  const userDomain = req.query.state; // ✅ Domain recovered from state
 
   if (!authCode || !userDomain)
     return res.status(400).send("Missing authorization code or domain");
@@ -108,7 +109,7 @@ app.get("/oauth/callback/canto", async (req, res) => {
         client_secret: process.env.CANTO_CLIENT_SECRET,
         redirect_uri: process.env.CANTO_REDIRECT_URI,
         code: authCode,
-        account_domain: userDomain, // ✅ Required here (but not in authorize step)
+        account_domain: userDomain, // ✅ Needed for token exchange
       }),
     });
 
