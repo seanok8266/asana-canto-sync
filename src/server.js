@@ -373,38 +373,53 @@ app.post("/upload", async (req, res) => {
 
 // Simple manual test route (JSON body)
 import Busboy from "busboy";
-import fs from "fs";
+import { Buffer } from "buffer";
+import { getToken } from "./db.js"; // keep your import if already there
 
 app.post("/test/upload-canto", async (req, res) => {
-  const tokenRecord = await getToken("canto");
-  if (!tokenRecord || !tokenRecord.access_token) {
-    return res.status(400).send("Canto token not found. Please reconnect Canto first.");
-  }
-
-  const uploadUrl = `https://${tokenRecord.domain}/api/v1/files`;
-  console.log("📤 Uploading to:", uploadUrl);
-
   const busboy = Busboy({ headers: req.headers });
-  let uploadPromise;
+  let domain, fileBuffer, fileName, mimeType;
 
-  busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
-    console.log("📦 Uploading file:", filename);
+  busboy.on("field", (name, val) => {
+    if (name === "domain") domain = val.trim();
+  });
 
-    const form = new FormData();
-    form.append("file", file, filename);
+  busboy.on("file", (name, file, info) => {
+    const chunks = [];
+    fileName = info.filename;
+    mimeType = info.mimeType;
+    console.log("📦 Uploading file:", info);
 
-    uploadPromise = fetch(uploadUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokenRecord.access_token}`,
-      },
-      body: form,
+    file.on("data", (data) => chunks.push(data));
+    file.on("end", () => {
+      fileBuffer = Buffer.concat(chunks);
     });
   });
 
   busboy.on("finish", async () => {
+    if (!domain) return res.status(400).send("Missing domain field.");
+    if (!fileBuffer) return res.status(400).send("No file received.");
+
+    const tokenRecord = await getToken(domain);
+    if (!tokenRecord || !tokenRecord.access_token) {
+      return res.status(400).send("Canto token not found for this domain.");
+    }
+
+    const uploadUrl = `https://${domain}/api/v1/files`;
+    console.log("📤 Uploading to:", uploadUrl);
+
     try {
-      const response = await uploadPromise;
+      const form = new FormData();
+      form.append("file", new Blob([fileBuffer], { type: mimeType }), fileName);
+
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${tokenRecord.access_token}`,
+        },
+        body: form,
+      });
+
       const text = await response.text();
       console.log("📩 Raw response from Canto:", text);
 
@@ -428,6 +443,7 @@ app.post("/test/upload-canto", async (req, res) => {
 
   req.pipe(busboy);
 });
+
 
 
 
