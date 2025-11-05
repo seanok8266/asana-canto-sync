@@ -381,28 +381,38 @@ app.post("/test/upload-canto", async (req, res) => {
     }
 
     const uploadUrl = `https://${tokenRecord.domain}/api/v1/upload`;
+    console.log("📤 Uploading to:", uploadUrl);
+    console.log("🔑 Using token (first 10 chars):", tokenRecord.access_token.slice(0, 10) + "...");
 
     const response = await fetch(uploadUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${tokenRecord.access_token}`,
       },
-      body: req.body, // Postman will provide this as the raw file
+      body: req, // Pass raw incoming stream from Postman
     });
 
-    const data = await response.json();
-    console.log("📤 Canto upload response:", data);
+    const text = await response.text();
+    console.log("📩 Raw response from Canto:", text);
 
-    if (data.error) {
-      return res.status(400).send("Canto upload failed: " + JSON.stringify(data.error));
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
     }
 
-    res.send(`<h2>✅ File uploaded to Canto!</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    if (response.ok) {
+      res.send(`<h2>✅ File uploaded to Canto!</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    } else {
+      res.status(400).send(`<h2>❌ Upload failed</h2><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    }
   } catch (err) {
     console.error("Canto upload error:", err);
     res.status(500).send("Error uploading file to Canto.");
   }
 });
+
 
 
 // =========================
