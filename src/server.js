@@ -50,6 +50,42 @@ app.get("/oauth/callback/asana", async (req, res) => {
       return res.status(400).send("Token exchange failed: " + tokenData.error);
 
     await saveToken("asana", tokenData);
+// ✅ Automatically re-register stored webhooks for existing projects
+if (tokenData.access_token && tokenData.refresh_token) {
+  try {
+    const storedToken = await getToken("asana");
+    if (storedToken?.asana_projects?.length) {
+      console.log("🔁 Re-registering webhooks for projects:", storedToken.asana_projects);
+
+      for (const projectId of storedToken.asana_projects) {
+        try {
+          const reReg = await fetch("https://app.asana.com/api/1.0/webhooks", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${tokenData.access_token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              resource: projectId,
+              target: `${process.env.APP_BASE_URL}/webhook/asana`,
+            }),
+          });
+
+          const reRegData = await reReg.json();
+          if (reRegData.errors) {
+            console.error(`⚠️ Webhook re-registration failed for ${projectId}:`, reRegData.errors);
+          } else {
+            console.log(`✅ Webhook re-registered for project ${projectId}`);
+          }
+        } catch (innerErr) {
+          console.error(`❌ Failed webhook re-registration for project ${projectId}:`, innerErr);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error during webhook auto-re-registration:", err);
+  }
+}
 
     // 2️⃣ Fetch all projects
     const projectResponse = await fetch("https://app.asana.com/api/1.0/projects", {
@@ -62,7 +98,7 @@ app.get("/oauth/callback/asana", async (req, res) => {
     }
 
     // 3️⃣ Show project selection form
-    res.send(`
+        res.send(`
       <h2>✅ Asana Connected!</h2>
       <h3>Select one or more projects to activate webhooks:</h3>
       <form action="/register/asana-webhooks" method="POST">
@@ -101,6 +137,7 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
     }
 
     const results = [];
+    const successfulProjects = [];
 
     for (const projectId of projectIds) {
       const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
@@ -111,17 +148,26 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
         },
         body: JSON.stringify({
           resource: projectId,
-          target: "https://asana-canto-sync.onrender.com/webhook/asana",
+          target: `${process.env.APP_BASE_URL}/webhook/asana`,
         }),
       });
 
       const data = await response.json();
+      const success = !data.errors;
       results.push({
         projectId,
-        success: !data.errors,
-        message: data.errors ? JSON.stringify(data.errors) : "Webhook registered successfully.",
+        success,
+        message: success
+          ? "Webhook registered successfully."
+          : JSON.stringify(data.errors),
       });
+
+      if (success) successfulProjects.push(projectId);
     }
+
+    // ✅ Save selected project IDs to DB for future auto-registration
+    tokenRecord.asana_projects = successfulProjects;
+    await saveToken("asana", tokenRecord);
 
     res.send(`
       <h2>🪝 Webhook Setup Complete</h2>
@@ -135,13 +181,14 @@ app.post("/register/asana-webhooks", express.urlencoded({ extended: true }), asy
           )
           .join("")}
       </ul>
-      <p>You can close this window.</p>
+      <p>These projects are now stored and will auto-register on reconnect.</p>
     `);
   } catch (err) {
     console.error("Webhook registration error:", err);
     res.status(500).send("Server error registering webhooks.");
   }
 });
+
 
 
 // =========================
