@@ -336,6 +336,13 @@ app.get("/oauth/callback/canto", async (req, res) => {
     console.log("🔥 CALLBACK HIT — raw query:", req.query);
   console.log("🔥 CALLBACK HIT — code:", req.query.code);
   console.log("🔥 CALLBACK HIT — state/domain:", req.query.state);
+ console.log("🟦 ENV CHECK — CANTO_APP_ID:", process.env.CANTO_APP_ID);
+console.log("🟦 ENV CHECK — CANTO_APP_SECRET:", process.env.CANTO_APP_SECRET ? "(present)" : "(MISSING)");
+console.log("🟦 ENV CHECK — CANTO_REDIRECT_URI:", process.env.CANTO_REDIRECT_URI);
+
+console.log("🟦 ABOUT TO CREATE PARAMS");
+
+
   const { code, state: domain } = req.query;
 
   if (!code || !domain) {
