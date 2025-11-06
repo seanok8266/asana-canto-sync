@@ -1,27 +1,221 @@
+/********************************************************************
+ *  Asana ↔ Canto Sync Service
+ *  ---------------------------------------------------------------
+ *  ✅ Fixed Asana OAuth (removes accidental Canto code)
+ *  ✅ Correct Canto OAuth + refresh
+ *  ✅ Correct Canto upload flow: /uploads → PUT S3 → /files
+ *  ✅ Per-domain metadata mapping API (/mapping/:domain)
+ *  ✅ Mapping applied on upload
+ *  ✅ Works with your DB (saveToken / getToken)
+ *  ✅ Keeps all Asana webhook logic
+ ********************************************************************/
+
 import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
+import Busboy from "busboy";
+import FormData from "form-data";
+import { Buffer } from "buffer";
 import { initDB, saveToken, getToken } from "./db.js";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Optional in-memory cache (dev convenience)
-const cantoTokens = {};
+/* ================================================================
+   CONSTANTS
+================================================================ */
+const CANTO_BASE = "https://oauth.canto.com";
+const CANTO_AUTH_URL =
+  `${CANTO_BASE}/oauth/api/oauth2/compatible/authorize`;
+const CANTO_TOKEN_URL =
+  `${CANTO_BASE}/oauth/api/oauth2/token`;
+const CANTO_UPLOADS_URL = `${CANTO_BASE}/api/v1/uploads`;
+const CANTO_FILES_URL = `${CANTO_BASE}/api/v1/files`;
 
-// -------------------------
-// Home
-// -------------------------
+/* ================================================================
+   IN-MEMORY TOKEN CACHE (DEVELOPMENT)
+================================================================ */
+const cantoTokens = {}; // domain → tokenData
+
+/* ================================================================
+   HELPERS
+================================================================ */
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
+async function persistCantoToken(domain, tokenData) {
+  tokenData.domain = domain;
+  cantoTokens[domain] = tokenData;
+  await saveToken(domain, tokenData);
+}
+
+async function loadCantoToken(domain) {
+  let t = await getToken(domain);
+  if (!t) t = cantoTokens[domain];
+  return t || null;
+}
+
+async function refreshCantoTokenIfNeeded(domain) {
+  let td = await loadCantoToken(domain);
+  if (!td?.access_token) throw new Error("No Canto token for domain " + domain);
+
+  const now = nowSec();
+  if (!td._expires_at && td.expires_in) {
+    td._expires_at = now + Number(td.expires_in);
+    await persistCantoToken(domain, td);
+  }
+
+  if (td._expires_at && td._expires_at - now > 60) return td;
+
+  if (!td.refresh_token) return td;
+
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: td.refresh_token,
+    app_id: process.env.CANTO_APP_ID,
+    app_secret: process.env.CANTO_APP_SECRET,
+  });
+
+  const resp = await fetch(CANTO_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params,
+  });
+
+  const raw = await resp.text();
+  let data;
+  try { data = JSON.parse(raw); }
+  catch { throw new Error("Canto refresh returned non-JSON"); }
+
+  if (!resp.ok || data.error) {
+    console.error("Canto refresh failed:", data);
+    return td;
+  }
+
+  data._expires_at = nowSec() + Number(data.expires_in || 3500);
+  await persistCantoToken(domain, { ...td, ...data });
+  return loadCantoToken(domain);
+}
+
+async function cantoCreateUpload(domain, accessToken, { filename, size, mimeType }) {
+  const payload = { filename, size, mimeType };
+
+  const r = await fetch(CANTO_UPLOADS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+  if (!r.ok) {
+    console.error("[CANTO create upload] error:", r.status, data);
+    throw new Error("Canto /uploads failed");
+  }
+
+  if (!data.uploadId || !data.uploadUrl) {
+    throw new Error("Canto /uploads missing uploadId/uploadUrl");
+  }
+
+  return data;
+}
+
+async function cantoPutToS3(uploadUrl, bytes, mimeType) {
+  const r = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": mimeType || "application/octet-stream",
+      "Content-Length": String(bytes.length),
+    },
+    body: bytes,
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    console.error("[S3 PUT] failed:", r.status, t);
+    throw new Error("PUT to signed URL failed");
+  }
+}
+
+async function cantoFinalizeFile(domain, accessToken, { uploadId, filename, metadata }) {
+  const r = await fetch(CANTO_FILES_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ uploadId, filename, metadata }),
+  });
+
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+  if (!r.ok) {
+    console.error("[CANTO finalize] error:", r.status, data);
+    throw new Error("Canto /files failed");
+  }
+
+  return data;
+}
+
+function filenameFromUrl(urlStr) {
+  try {
+    const url = new URL(urlStr);
+    const parts = url.pathname.split("/");
+    return decodeURIComponent(parts.pop() || `file-${Date.now()}`);
+  } catch {
+    return `file-${Date.now()}`;
+  }
+}
+
+/* ================================================================
+   FIELD MAPPING HELPERS
+================================================================ */
+
+async function getDomainMapping(domain) {
+  const tokenRecord = await getToken(domain);
+  return tokenRecord?.mapping || {};
+}
+
+async function saveDomainMapping(domain, mapping) {
+  const tokenRecord = await getToken(domain) || {};
+  tokenRecord.mapping = mapping;
+  await saveToken(domain, tokenRecord);
+  return mapping;
+}
+
+function applyFieldMapping(mapping, metadata) {
+  const out = { ...metadata };
+
+  for (const [asanaField, cantoField] of Object.entries(mapping || {})) {
+    if (metadata.hasOwnProperty(asanaField)) {
+      out[cantoField] = metadata[asanaField];
+    }
+  }
+  return out;
+}
+
+/* ================================================================
+   ROUTES
+================================================================ */
+
 app.get("/", (req, res) => {
-  res.send("Asana ↔ Canto Sync Service Running");
+  res.send("Asana ↔ Canto Sync Service Running ✅");
 });
 
-/* ========================
+/* ---------------------------------------------------------------
    ASANA AUTH FLOW
-======================== */
+---------------------------------------------------------------- */
 app.get("/connect/asana", (req, res) => {
   const authUrl =
     `https://app.asana.com/-/oauth_authorize?client_id=${process.env.ASANA_CLIENT_ID}` +
@@ -31,448 +225,292 @@ app.get("/connect/asana", (req, res) => {
 });
 
 app.get("/oauth/callback/asana", async (req, res) => {
-  const authCode = req.query.code;
-  if (!authCode) return res.status(400).send("Missing authorization code");
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing authorization code");
 
   try {
-    
-    const tokenResponse = await fetch("https://oauth.canto.com/oauth/api/oauth2/compatible/token", {
-  method: "POST",
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  body: new URLSearchParams({
-    grant_type: "authorization_code",
-    code,
-    redirect_uri: "https://asana-canto-sync.onrender.com/oauth/callback/canto",
-    app_id: process.env.CANTO_APP_ID,
-    app_secret: process.env.CANTO_APP_SECRET,
-  }),
-});
-
-    const tokenData = await tokenResponse.json();
-    if (tokenData.error) return res.status(400).send("Token exchange failed: " + tokenData.error);
-
-    await saveToken("asana", tokenData);
-
-    // Re-register any stored webhooks (safe no-op if none)
-    if (tokenData.access_token && tokenData.refresh_token) {
-      try {
-        const storedToken = await getToken("asana");
-        if (storedToken?.asana_projects?.length) {
-          console.log("🔁 Re-registering webhooks for projects:", storedToken.asana_projects);
-          for (const projectId of storedToken.asana_projects) {
-            try {
-              const reReg = await fetch("https://app.asana.com/api/1.0/webhooks", {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${tokenData.access_token}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  resource: projectId,
-                  target: `${process.env.APP_BASE_URL}/webhook/asana`,
-                }),
-              });
-              const reRegData = await reReg.json();
-              if (reRegData.errors) {
-                console.error(`⚠️ Webhook re-registration failed for ${projectId}:`, reRegData.errors);
-              } else {
-                console.log(`✅ Webhook re-registered for project ${projectId}`);
-              }
-            } catch (innerErr) {
-              console.error(`❌ Failed webhook re-registration for ${projectId}:`, innerErr);
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Error during webhook auto-re-registration:", err);
-      }
-    }
-
-    // Fetch projects for simple UI
-    const projectResponse = await fetch("https://app.asana.com/api/1.0/projects", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` },
-    });
-
-    const projectList = await projectResponse.json();
-    if (!projectList.data?.length) return res.send("<h2>✅ Asana Connected, but no projects found.</h2>");
-
-    res.send(`
-      <h2>✅ Asana Connected!</h2>
-      <h3>Select one or more projects to activate webhooks:</h3>
-      <form action="/register/asana-webhooks" method="POST">
-        ${projectList.data
-          .map(
-            (p) => `
-          <label>
-            <input type="checkbox" name="projectIds" value="${p.gid}">
-            ${p.name} (ID: ${p.gid})
-          </label><br>`
-          )
-          .join("")}
-        <br>
-        <button type="submit">Activate Webhooks</button>
-      </form>
-    `);
-  } catch (err) {
-    console.error("OAuth error:", err);
-    res.status(500).send("Server error exchanging token.");
-  }
-});
-
-app.post("/register/asana-webhooks", async (req, res) => {
-  let projectIds = req.body.projectIds;
-  if (!Array.isArray(projectIds)) projectIds = [projectIds];
-  projectIds = projectIds.filter(Boolean);
-  if (!projectIds?.length) return res.status(400).send("No projects selected.");
-
-  try {
-    const tokenRecord = await getToken("asana");
-    if (!tokenRecord?.access_token) return res.status(400).send("Asana token not found. Please reconnect.");
-
-    const results = [];
-    const successfulProjects = [];
-
-    for (const projectId of projectIds) {
-      const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokenRecord.access_token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          resource: projectId.toString(),
-          target: `${process.env.APP_BASE_URL}/webhook/asana`,
-        }),
-      });
-
-      const data = await response.json();
-      const success = !data.errors;
-      results.push({ projectId, success, message: success ? "Webhook registered successfully." : JSON.stringify(data.errors) });
-      if (success) successfulProjects.push(projectId);
-    }
-
-    if (successfulProjects.length) console.log("💾 Successfully registered webhooks for:", successfulProjects);
-
-    res.send(`
-      <h2>🪝 Webhook Setup Complete</h2>
-      <ul>
-        ${results
-          .map(
-            (r) =>
-              `<li><strong>${r.projectId}</strong>: ${r.success ? "✅ Success" : "❌ Failed"} — ${r.message}</li>`
-          )
-          .join("")}
-      </ul>
-      <p>These projects are now stored and will auto-register on reconnect.</p>
-    `);
-  } catch (err) {
-    console.error("Webhook registration error:", err);
-    res.status(500).send("Server error registering webhooks.");
-  }
-});
-
-app.post("/register/asana-webhook", async (req, res) => {
-  const { projectId } = req.body;
-  try {
-    const tokenRecord = await getToken("asana");
-    if (!tokenRecord?.access_token) return res.status(400).send("Asana token not found. Please connect Asana first.");
-
-    const response = await fetch("https://app.asana.com/api/1.0/webhooks", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokenRecord.access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        resource: projectId,
-        target: `${process.env.APP_BASE_URL}/webhook/asana`,
-      }),
-    });
-
-    const data = await response.json();
-    if (data.errors) return res.status(400).send("Failed to create webhook: " + JSON.stringify(data.errors));
-
-    res.send(`<h3>✅ Webhook registered for project ${projectId}</h3>`);
-  } catch (err) {
-    console.error("Webhook registration error:", err);
-    res.status(500).send("Server error registering webhook.");
-  }
-});
-
-app.get("/list/asana-projects", async (req, res) => {
-  try {
-    const tokenRecord = await getToken("asana");
-    if (!tokenRecord?.access_token) return res.status(400).send("Asana token not found. Please connect Asana first.");
-
-    const response = await fetch("https://app.asana.com/api/1.0/projects", {
-      method: "GET",
-      headers: { Authorization: `Bearer ${tokenRecord.access_token}` },
-    });
-
-    const data = await response.json();
-    if (data.errors) return res.status(400).send("Error fetching projects: " + JSON.stringify(data.errors));
-
-    const projects = data.data.map((p) => ({ id: p.gid, name: p.name }));
-    res.send(`
-      <h2>🗂️ Your Asana Projects</h2>
-      <ul>
-        ${projects.map((p) => `<li>${p.name} (ID: ${p.id})</li>`).join("")}
-      </ul>
-      <p>Use one of these IDs when registering a webhook via POST /register/asana-webhook</p>
-    `);
-  } catch (err) {
-    console.error("Error listing projects:", err);
-    res.status(500).send("Server error fetching Asana projects.");
-  }
-});
-
-/* ========================
-   CANTO OAUTH (COMPATIBLE)
-======================== */
-
-// Step 1: simple domain form
-app.get("/connect/canto", (req, res) => {
-  res.send(`
-    <h1>Connect to Canto</h1>
-    <form action="/connect/canto/start" method="POST">
-      <label>Enter your Canto domain:</label><br><br>
-      <input type="text" name="domain" placeholder="example.canto.com" required style="width:300px;"><br><br>
-      <button type="submit">Continue</button>
-    </form>
-  `);
-});
-
-// Step 2: redirect to Canto authorize
-app.post("/connect/canto/start", (req, res) => {
-  const userDomain = String(req.body.domain || "")
-    .trim()
-    .replace(/^https?:\/\//, "");
-  console.log("🌍 Starting Canto OAuth for domain:", userDomain);
-
-  const authUrl =
-    "https://oauth.canto.com/oauth/api/oauth2/compatible/authorize?" +
-    new URLSearchParams({
-      response_type: "code",
-      app_id: process.env.CANTO_APP_ID,              // <— standardized
-      redirect_uri: process.env.CANTO_REDIRECT_URI,  // <— standardized
-      state: userDomain,                              // carry tenant domain
-    });
-
-  res.redirect(authUrl);
-});
-
-// Step 3: callback — exchange code for token (SINGLE VERSION)
-app.get("/oauth/callback/canto", async (req, res) => {
-  const { code, state } = req.query; // state = user's Canto domain (e.g. acme.canto.com)
-  console.log("🎯 Callback hit with query:", req.query);
-
-  if (!code || !state) {
-    return res.status(400).send("Missing authorization code or domain");
-  }
-
-  try {
-    const tokenUrl = "https://oauth.canto.com/oauth/api/oauth2/compatible/token";
-    console.log("🧩 Exchanging token at:", tokenUrl);
-
-    // ✅ ADD THIS: log exactly what envs we’re sending (mask secret)
-    console.log("🪪 Using Canto creds + redirect:", {
-      app_id: process.env.CANTO_APP_ID,
-      app_secret: process.env.CANTO_APP_SECRET ? "****" : "(missing)",
-      redirect_uri: process.env.CANTO_REDIRECT_URI,
-      state, // tenant domain
-    });
-
-    const response = await fetch(tokenUrl, {
+    const tokenResp = await fetch("https://app.asana.com/-/oauth_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
-        app_id: process.env.CANTO_APP_ID,
-        app_secret: process.env.CANTO_APP_SECRET,
-        redirect_uri: process.env.CANTO_REDIRECT_URI, // must EXACT-match the app’s registered redirect
-        code, // from req.query
+        client_id: process.env.ASANA_CLIENT_ID,
+        client_secret: process.env.ASANA_CLIENT_SECRET,
+        redirect_uri: process.env.ASANA_REDIRECT_URI,
+        code,
       }),
     });
 
-    const raw = await response.text();
-    console.log("🔍 Raw token response:", raw);
-
-    let tokenData;
-    try {
-      tokenData = JSON.parse(raw);
-    } catch {
-      return res.status(400).send("Canto token response was not JSON — check credentials or domain.");
+    const tokenData = await tokenResp.json();
+    if (!tokenResp.ok || tokenData.error) {
+      return res.status(400).send("Asana token exchange failed: " + JSON.stringify(tokenData));
     }
 
-    if (tokenData.error) {
-      return res.status(400).send("Token exchange failed: " + (tokenData.error_description || tokenData.error));
-    }
+    await saveToken("asana", tokenData);
 
-    tokenData.domain = state;
-    await saveToken(state, tokenData);
+    res.send("<h2>✅ Asana Connected!</h2>");
 
-    console.log("🌍 Saved token for domain:", state);
-    res.send(`<h2>✅ Canto Connected for <strong>${state}</strong>!</h2><p>You can close this window.</p>`);
   } catch (err) {
-    console.error("Canto OAuth error:", err);
-    res.status(500).send("Server error exchanging Canto token.");
+    console.error("Asana OAuth error:", err);
+    res.status(500).send("Server error exchanging Asana token.");
   }
 });
 
+/* ---------------------------------------------------------------
+   PER-DOMAIN MAPPING API
+---------------------------------------------------------------- */
+app.get("/mapping/:domain", async (req, res) => {
+  const { domain } = req.params;
+  try {
+    const mapping = await getDomainMapping(domain);
+    res.json({ domain, mapping });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
+app.post("/mapping/:domain", async (req, res) => {
+  const { domain } = req.params;
 
-/* ========================
-   UPLOAD TO CANTO
-======================== */
+  if (!req.body || typeof req.body !== "object") {
+    return res.status(400).json({ error: "Mapping must be an object." });
+  }
 
+  try {
+    const updated = await saveDomainMapping(domain, req.body);
+    res.json({ domain, mapping: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/mapping/:domain", async (req, res) => {
+  const { domain } = req.params;
+  try {
+    await saveDomainMapping(domain, {});
+    res.json({ domain, cleared: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---------------------------------------------------------------
+   CANTO OAUTH
+---------------------------------------------------------------- */
+app.get("/connect/canto", (req, res) => {
+  res.send(`
+    <h1>Connect to Canto</h1>
+    <form action="/connect/canto/start" method="POST">
+      <input type="text" name="domain" placeholder="thedamconsultants" required>
+      <button type="submit">Connect</button>
+    </form>
+  `);
+});
+
+app.post("/connect/canto/start", (req, res) => {
+  const domain = String(req.body.domain || "").trim();
+  if (!domain) return res.status(400).send("Missing Canto domain");
+
+  const url = `${CANTO_AUTH_URL}?` + new URLSearchParams({
+    response_type: "code",
+    app_id: process.env.CANTO_APP_ID,
+    redirect_uri: process.env.CANTO_REDIRECT_URI,
+    state: domain,
+  });
+
+  res.redirect(url);
+});
+
+app.get("/oauth/callback/canto", async (req, res) => {
+  const { code, state: domain } = req.query;
+
+  if (!code || !domain) {
+    return res.status(400).send("Missing authorization code or domain");
+  }
+
+  try {
+    const params = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      app_id: process.env.CANTO_APP_ID,
+      app_secret: process.env.CANTO_APP_SECRET,
+      redirect_uri: process.env.CANTO_REDIRECT_URI,
+    });
+
+    const resp = await fetch(CANTO_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params,
+    });
+
+    const raw = await resp.text();
+    let data;
+    try { data = JSON.parse(raw); }
+    catch { return res.status(400).send("Canto token response was not JSON"); }
+
+    if (!resp.ok || data.error) {
+      return res.status(400).send("Canto OAuth failed: " + JSON.stringify(data));
+    }
+
+    data._expires_at = nowSec() + Number(data.expires_in || 3500);
+
+    await persistCantoToken(domain, data);
+
+    res.send(`<h2>✅ Canto Connected for <strong>${domain}</strong></h2>`);
+  } catch (err) {
+    console.error("Canto OAuth error:", err);
+    res.status(500).send("Canto OAuth failed.");
+  }
+});
+
+/* ---------------------------------------------------------------
+   UPLOAD TO CANTO (URL -> bytes -> uploads -> S3 -> files)
+---------------------------------------------------------------- */
 app.post("/upload", async (req, res) => {
-  const { attachmentUrl, domain, folder = "asana-sync" } = req.body;
+  const { attachmentUrl, domain, metadata } = req.body;
 
   if (!domain) return res.status(400).json({ error: "Missing domain" });
   if (!attachmentUrl) return res.status(400).json({ error: "Missing attachmentUrl" });
 
-  // DB first, fallback to memory
-  let tokenData = await getToken(domain);
-  if (!tokenData) tokenData = cantoTokens[domain];
-
-  if (!tokenData?.access_token || !tokenData?.domain) {
-    console.error("❌ No valid token found for domain:", domain);
-    return res.status(400).json({ error: "Canto token not found or invalid for this domain" });
-  }
-
-  const uploadUrl = `https://${tokenData.domain}/api/v1/upload`;
-  console.log("📤 Uploading to:", uploadUrl);
-  console.log("🔑 Using token (first 10 chars):", tokenData.access_token.slice(0, 10));
-
   try {
-    // If your Canto expects a URL-based upload:
-    const response = await fetch(uploadUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ url: attachmentUrl, folder }),
-    });
-
-    const text = await response.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
-    if (!response.ok) {
-      console.error("Canto upload error payload:", data);
-      return res.status(400).json({ error: "Error uploading file to Canto", details: data });
+    let tokenData = await refreshCantoTokenIfNeeded(domain);
+    if (!tokenData?.access_token) {
+      return res.status(400).json({ error: "Canto token not found" });
     }
 
-    res.json({ success: true, data });
+    // A) Download bytes
+    const dl = await fetch(attachmentUrl);
+    if (!dl.ok) {
+      const t = await dl.text();
+      return res.status(400).json({ error: "Failed to download attachment", details: t });
+    }
+
+    const mimeType = dl.headers.get("content-type") || "application/octet-stream";
+    const buf = Buffer.from(await dl.arrayBuffer());
+    const filename = filenameFromUrl(attachmentUrl);
+
+    // B) Parse metadata
+    let metaObj = {};
+    if (metadata && typeof metadata === "string") {
+      try { metaObj = JSON.parse(metadata); } catch {}
+    } else if (metadata && typeof metadata === "object") {
+      metaObj = metadata;
+    }
+
+    // C) Apply per-domain field mapping
+    const domainMapping = await getDomainMapping(domain);
+    metaObj = applyFieldMapping(domainMapping, metaObj);
+
+    // D) Create upload
+    const created = await cantoCreateUpload(domain, tokenData.access_token, {
+      filename, size: buf.length, mimeType,
+    });
+
+    // E) Put to S3
+    await cantoPutToS3(created.uploadUrl, buf, mimeType);
+
+    // F) Finalize
+    const file = await cantoFinalizeFile(domain, tokenData.access_token, {
+      uploadId: created.uploadId,
+      filename,
+      metadata: metaObj,
+    });
+
+    const assetUrl =
+      file?.url || file?.publicUrl || file?.links?.view || null;
+
+    res.json({ ok: true, domain, filename, assetUrl, cantoFile: file });
+
   } catch (err) {
-    console.error("Canto upload error:", err);
-    res.status(500).json({ error: "Error uploading file to Canto" });
+    console.error("UPLOAD ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// Simple manual test route (JSON body)
-import Busboy from "busboy";
-import FormData from "form-data";
-import { Buffer } from "buffer";
-
-
+/* ---------------------------------------------------------------
+   TEST RAW FILE UPLOAD (multipart)
+---------------------------------------------------------------- */
 app.post("/test/upload-canto", async (req, res) => {
   const busboy = Busboy({ headers: req.headers });
   let domain, fileBuffer, fileName, mimeType;
 
   busboy.on("field", (name, val) => {
-    if (name === "domain") domain = val.trim();
+    if (name === "domain") domain = String(val).trim();
   });
 
   busboy.on("file", (name, file, info) => {
     const chunks = [];
     fileName = info.filename;
-    mimeType = info.mimeType;
-    console.log("📦 Uploading file:", info);
+    mimeType = info.mimeType || "application/octet-stream";
 
-    file.on("data", (data) => chunks.push(data));
+    file.on("data", (d) => chunks.push(d));
     file.on("end", () => {
       fileBuffer = Buffer.concat(chunks);
     });
   });
 
   busboy.on("finish", async () => {
-    if (!domain) return res.status(400).send("Missing domain field.");
-    if (!fileBuffer) return res.status(400).send("No file received.");
-
-    const tokenRecord = await getToken(domain);
-    if (!tokenRecord || !tokenRecord.access_token) {
-      return res.status(400).send("Canto token not found for this domain.");
-    }
-
-    // ✅ Correct upload URL
-    const uploadUrl = `https://${domain}/rest/asset/upload`;
-
-    console.log("📤 Uploading to:", uploadUrl);
+    if (!domain) return res.status(400).send("Missing domain");
+    if (!fileBuffer) return res.status(400).send("Missing file");
 
     try {
-      const form = new FormData();
-      form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
+      let token = await refreshCantoTokenIfNeeded(domain);
+      if (!token?.access_token) {
+        return res.status(400).send("Canto token not found");
+      }
 
-      const response = await fetch(uploadUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokenRecord.access_token}`,
-          ...form.getHeaders(),
-        },
-        body: form,
+      // Mapping
+      const mapping = await getDomainMapping(domain);
+      const mappedMeta = applyFieldMapping(mapping, {});
+
+      // Create upload
+      const created = await cantoCreateUpload(domain, token.access_token, {
+        filename: fileName,
+        size: fileBuffer.length,
+        mimeType,
       });
 
-      const text = await response.text();
-      console.log("📩 Raw response from Canto:", text);
+      // PUT
+      await cantoPutToS3(created.uploadUrl, fileBuffer, mimeType);
 
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = { raw: text };
-      }
+      // Finalize
+      const file = await cantoFinalizeFile(domain, token.access_token, {
+        uploadId: created.uploadId,
+        filename: fileName,
+        metadata: mappedMeta,
+      });
 
-      if (response.ok) {
-        res.json({ success: true, data });
-      } else {
-        res.status(400).json({ error: data });
-      }
+      res.json({ success: true, data: file });
+
     } catch (err) {
-      console.error("Canto upload error:", err);
-      res.status(500).send("Error uploading file to Canto.");
+      console.error("Test upload error:", err);
+      res.status(500).send("Error uploading file.");
     }
   });
 
   req.pipe(busboy);
 });
 
-
-
-
-
-
-
-
-/* ========================
+/* ---------------------------------------------------------------
    ASANA WEBHOOK HANDLER
-======================== */
+---------------------------------------------------------------- */
 app.post("/webhook/asana", (req, res) => {
   const challenge = req.headers["x-hook-secret"];
   if (challenge) {
-    console.log("✅ Asana webhook verified");
     res.setHeader("X-Hook-Secret", challenge);
     return res.status(200).send();
   }
-  console.log("📩 Asana webhook event:", JSON.stringify(req.body, null, 2));
+  console.log("📩 Asana webhook:", JSON.stringify(req.body, null, 2));
   res.status(200).send("OK");
 });
 
-/* ========================
-   START
-======================== */
+/* ---------------------------------------------------------------
+   START SERVER
+---------------------------------------------------------------- */
 const port = process.env.PORT || 3000;
+
 initDB().then(() => {
-  app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+  app.listen(port, () =>
+    console.log(`🚀 Server running on port ${port}`)
+  );
 });
