@@ -30,7 +30,7 @@ app.use(express.urlencoded({ extended: true }));
 ================================================================ */
 const CANTO_BASE = "https://oauth.canto.com";
 const CANTO_AUTH_URL = `${CANTO_BASE}/oauth/api/oauth2/compatible/authorize`;
-const CANTO_TOKEN_URL = `${CANTO_BASE}/oauth/api/oauth2/token`;
+const CANTO_TOKEN_URL = `${CANTO_BASE}/oauth/api/oauth2/compatible/token`;
 const CANTO_UPLOADS_URL = `${CANTO_BASE}/api/v1/uploads`;
 const CANTO_FILES_URL = `${CANTO_BASE}/api/v1/files`;
 
