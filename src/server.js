@@ -104,6 +104,10 @@ async function refreshCantoTokenIfNeeded(domain) {
 }
 
 async function cantoCreateUpload(domain, accessToken, { filename, size, mimeType }) {
+  console.log("🟦 CANTO CREATE UPLOAD — START");
+  console.log("🟦 Using access token:", accessToken ? accessToken.slice(0, 8) + "..." : "(none)");
+  console.log("🟦 Payload:", { filename, size, mimeType });
+
   const payload = { filename, size, mimeType };
 
   const r = await fetch(CANTO_UPLOADS_URL, {
@@ -116,6 +120,9 @@ async function cantoCreateUpload(domain, accessToken, { filename, size, mimeType
   });
 
   const text = await r.text();
+  console.log("🟥 RAW /uploads RESPONSE:", text);
+  console.log("🟥 HTTP STATUS:", r.status);
+
   let data;
   try {
     data = JSON.parse(text);
@@ -129,11 +136,14 @@ async function cantoCreateUpload(domain, accessToken, { filename, size, mimeType
   }
 
   if (!data.uploadId || !data.uploadUrl) {
+    console.error("🟥 Missing uploadId or uploadUrl:", data);
     throw new Error("Canto /uploads missing uploadId/uploadUrl");
   }
 
+  console.log("✅ UPLOAD INIT CREATED:", data);
   return data;
 }
+
 
 async function cantoPutToS3(uploadUrl, bytes, mimeType) {
   const r = await fetch(uploadUrl, {
