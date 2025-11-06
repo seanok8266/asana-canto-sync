@@ -333,15 +333,16 @@ app.post("/connect/canto/start", (req, res) => {
 });
 
 app.get("/oauth/callback/canto", async (req, res) => {
-    console.log("🔥 CALLBACK HIT — raw query:", req.query);
+  console.log("🔥 CALLBACK HIT — raw query:", req.query);
   console.log("🔥 CALLBACK HIT — code:", req.query.code);
   console.log("🔥 CALLBACK HIT — state/domain:", req.query.state);
- console.log("🟦 ENV CHECK — CANTO_APP_ID:", process.env.CANTO_APP_ID);
-console.log("🟦 ENV CHECK — CANTO_APP_SECRET:", process.env.CANTO_APP_SECRET ? "(present)" : "(MISSING)");
-console.log("🟦 ENV CHECK — CANTO_REDIRECT_URI:", process.env.CANTO_REDIRECT_URI);
 
-console.log("🟦 ABOUT TO CREATE PARAMS");
+  console.log("🟦 ENV CHECK — CANTO_APP_ID:", process.env.CANTO_APP_ID);
+  console.log("🟦 ENV CHECK — CANTO_APP_SECRET:", process.env.CANTO_APP_SECRET ? "(present)" : "(MISSING)");
+  console.log("🟦 ENV CHECK — CANTO_REDIRECT_URI:", process.env.CANTO_REDIRECT_URI);
 
+  console.log("🟦 ABOUT TO CREATE PARAMS");
+  console.log("🟦 TOKEN URL BEING USED:", CANTO_TOKEN_URL);
 
   const { code, state: domain } = req.query;
 
@@ -358,13 +359,21 @@ console.log("🟦 ABOUT TO CREATE PARAMS");
       redirect_uri: process.env.CANTO_REDIRECT_URI,
     });
 
+    // ✅ ADD THESE 2 LINES
+    console.log("🟩 PARAMS CREATED:", params.toString());
+    console.log("🔗 POSTING TO TOKEN URL:", CANTO_TOKEN_URL);
+
     const resp = await fetch(CANTO_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: params,
     });
 
+    // ✅ ADD THESE 2 LINES — critical
+    console.log("✅ TOKEN SERVER RESPONDED — HTTP STATUS:", resp.status);
     const raw = await resp.text();
+    console.log("📩 RAW TOKEN RESPONSE:", raw);
+
     let data;
     try {
       data = JSON.parse(raw);
@@ -377,7 +386,6 @@ console.log("🟦 ABOUT TO CREATE PARAMS");
     }
 
     data._expires_at = nowSec() + Number(data.expires_in || 3500);
-
     await persistCantoToken(domain, data);
 
     res.send(`<h2>✅ Canto Connected for <strong>${domain}</strong></h2>`);
@@ -386,6 +394,8 @@ console.log("🟦 ABOUT TO CREATE PARAMS");
     res.status(500).send("Canto OAuth failed.");
   }
 });
+
+
 
 /* ---------------------------------------------------------------
    UPLOAD TO CANTO (URL -> bytes -> uploads -> S3 -> files)
