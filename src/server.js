@@ -333,6 +333,9 @@ app.post("/connect/canto/start", (req, res) => {
 });
 
 app.get("/oauth/callback/canto", async (req, res) => {
+    console.log("🔥 CALLBACK HIT — raw query:", req.query);
+  console.log("🔥 CALLBACK HIT — code:", req.query.code);
+  console.log("🔥 CALLBACK HIT — state/domain:", req.query.state);
   const { code, state: domain } = req.query;
 
   if (!code || !domain) {
