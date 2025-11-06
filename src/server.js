@@ -8,6 +8,7 @@
  *  ✅ Mapping applied on upload
  *  ✅ Works with your DB (saveToken / getToken)
  *  ✅ Keeps all Asana webhook logic
+ *  ✅ Includes /dashboard/:domain and /mapping-ui/:domain
  ********************************************************************/
 
 import express from "express";
@@ -28,10 +29,8 @@ app.use(express.urlencoded({ extended: true }));
    CONSTANTS
 ================================================================ */
 const CANTO_BASE = "https://oauth.canto.com";
-const CANTO_AUTH_URL =
-  `${CANTO_BASE}/oauth/api/oauth2/compatible/authorize`;
-const CANTO_TOKEN_URL =
-  `${CANTO_BASE}/oauth/api/oauth2/token`;
+const CANTO_AUTH_URL = `${CANTO_BASE}/oauth/api/oauth2/compatible/authorize`;
+const CANTO_TOKEN_URL = `${CANTO_BASE}/oauth/api/oauth2/token`;
 const CANTO_UPLOADS_URL = `${CANTO_BASE}/api/v1/uploads`;
 const CANTO_FILES_URL = `${CANTO_BASE}/api/v1/files`;
 
@@ -88,8 +87,11 @@ async function refreshCantoTokenIfNeeded(domain) {
 
   const raw = await resp.text();
   let data;
-  try { data = JSON.parse(raw); }
-  catch { throw new Error("Canto refresh returned non-JSON"); }
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error("Canto refresh returned non-JSON");
+  }
 
   if (!resp.ok || data.error) {
     console.error("Canto refresh failed:", data);
@@ -115,7 +117,11 @@ async function cantoCreateUpload(domain, accessToken, { filename, size, mimeType
 
   const text = await r.text();
   let data;
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
   if (!r.ok) {
     console.error("[CANTO create upload] error:", r.status, data);
@@ -158,7 +164,11 @@ async function cantoFinalizeFile(domain, accessToken, { uploadId, filename, meta
 
   const text = await r.text();
   let data;
-  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
 
   if (!r.ok) {
     console.error("[CANTO finalize] error:", r.status, data);
@@ -181,14 +191,13 @@ function filenameFromUrl(urlStr) {
 /* ================================================================
    FIELD MAPPING HELPERS
 ================================================================ */
-
 async function getDomainMapping(domain) {
   const tokenRecord = await getToken(domain);
   return tokenRecord?.mapping || {};
 }
 
 async function saveDomainMapping(domain, mapping) {
-  const tokenRecord = await getToken(domain) || {};
+  const tokenRecord = (await getToken(domain)) || {};
   tokenRecord.mapping = mapping;
   await saveToken(domain, tokenRecord);
   return mapping;
@@ -196,9 +205,8 @@ async function saveDomainMapping(domain, mapping) {
 
 function applyFieldMapping(mapping, metadata) {
   const out = { ...metadata };
-
   for (const [asanaField, cantoField] of Object.entries(mapping || {})) {
-    if (metadata.hasOwnProperty(asanaField)) {
+    if (Object.prototype.hasOwnProperty.call(metadata, asanaField)) {
       out[cantoField] = metadata[asanaField];
     }
   }
@@ -243,13 +251,14 @@ app.get("/oauth/callback/asana", async (req, res) => {
 
     const tokenData = await tokenResp.json();
     if (!tokenResp.ok || tokenData.error) {
-      return res.status(400).send("Asana token exchange failed: " + JSON.stringify(tokenData));
+      return res
+        .status(400)
+        .send("Asana token exchange failed: " + JSON.stringify(tokenData));
     }
 
     await saveToken("asana", tokenData);
 
     res.send("<h2>✅ Asana Connected!</h2>");
-
   } catch (err) {
     console.error("Asana OAuth error:", err);
     res.status(500).send("Server error exchanging Asana token.");
@@ -311,12 +320,14 @@ app.post("/connect/canto/start", (req, res) => {
   const domain = String(req.body.domain || "").trim();
   if (!domain) return res.status(400).send("Missing Canto domain");
 
-  const url = `${CANTO_AUTH_URL}?` + new URLSearchParams({
-    response_type: "code",
-    app_id: process.env.CANTO_APP_ID,
-    redirect_uri: process.env.CANTO_REDIRECT_URI,
-    state: domain,
-  });
+  const url =
+    `${CANTO_AUTH_URL}?` +
+    new URLSearchParams({
+      response_type: "code",
+      app_id: process.env.CANTO_APP_ID,
+      redirect_uri: process.env.CANTO_REDIRECT_URI,
+      state: domain,
+    });
 
   res.redirect(url);
 });
@@ -345,8 +356,11 @@ app.get("/oauth/callback/canto", async (req, res) => {
 
     const raw = await resp.text();
     let data;
-    try { data = JSON.parse(raw); }
-    catch { return res.status(400).send("Canto token response was not JSON"); }
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return res.status(400).send("Canto token response was not JSON");
+    }
 
     if (!resp.ok || data.error) {
       return res.status(400).send("Canto OAuth failed: " + JSON.stringify(data));
@@ -392,7 +406,9 @@ app.post("/upload", async (req, res) => {
     // B) Parse metadata
     let metaObj = {};
     if (metadata && typeof metadata === "string") {
-      try { metaObj = JSON.parse(metadata); } catch {}
+      try {
+        metaObj = JSON.parse(metadata);
+      } catch {}
     } else if (metadata && typeof metadata === "object") {
       metaObj = metadata;
     }
@@ -403,7 +419,9 @@ app.post("/upload", async (req, res) => {
 
     // D) Create upload
     const created = await cantoCreateUpload(domain, tokenData.access_token, {
-      filename, size: buf.length, mimeType,
+      filename,
+      size: buf.length,
+      mimeType,
     });
 
     // E) Put to S3
@@ -416,11 +434,9 @@ app.post("/upload", async (req, res) => {
       metadata: metaObj,
     });
 
-    const assetUrl =
-      file?.url || file?.publicUrl || file?.links?.view || null;
+    const assetUrl = file?.url || file?.publicUrl || file?.links?.view || null;
 
     res.json({ ok: true, domain, filename, assetUrl, cantoFile: file });
-
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
     res.status(500).json({ ok: false, error: err.message });
@@ -481,7 +497,6 @@ app.post("/test/upload-canto", async (req, res) => {
       });
 
       res.json({ success: true, data: file });
-
     } catch (err) {
       console.error("Test upload error:", err);
       res.status(500).send("Error uploading file.");
@@ -504,21 +519,153 @@ app.post("/webhook/asana", (req, res) => {
   res.status(200).send("OK");
 });
 
-/* ---------------------------------------------------------------
-   TEST RAW FILE UPLOAD (multipart)
----------------------------------------------------------------- */
-app.post("/test/upload-canto", async (req, res) => {
-  // ... (test upload code)
-});
-
-
 /* ================================================================
    FIELD MAPPING UI (HTML + JS)
    ---------------------------------------------------------------
    Visit: /mapping-ui/:domain
 ================================================================ */
 app.get("/mapping-ui/:domain", async (req, res) => {
-  // ... the entire mapping UI HTML code I gave you ...
+  const { domain } = req.params;
+
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Canto Field Mapping – ${domain}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 text-gray-900">
+  <div class="max-w-3xl mx-auto mt-10 p-8 bg-white shadow-lg rounded-lg">
+    <h1 class="text-3xl font-bold mb-6">
+      Canto Field Mapping for <span class="text-indigo-600">${domain}</span>
+    </h1>
+
+    <table class="w-full mb-6 border">
+      <thead class="bg-gray-200">
+        <tr>
+          <th class="p-3 text-left">Asana Field</th>
+          <th class="p-3 text-left">Canto Field</th>
+          <th class="p-3"></th>
+        </tr>
+      </thead>
+      <tbody id="mappingRows"></tbody>
+    </table>
+
+    <div class="flex gap-4 mb-6">
+      <input id="newAsana" class="border p-2 flex-1 rounded" placeholder="Asana Field Name">
+      <input id="newCanto" class="border p-2 flex-1 rounded" placeholder="Canto Field Key">
+      <button onclick="addRow()" class="bg-green-600 px-4 py-2 text-white rounded">Add</button>
+    </div>
+
+    <div class="flex gap-4">
+      <button onclick="saveMapping()" class="bg-indigo-600 text-white px-6 py-2 rounded">Save Mapping</button>
+      <button onclick="resetMapping()" class="bg-red-600 text-white px-6 py-2 rounded">Reset Mapping</button>
+      <a href="/dashboard/${domain}" class="ml-auto bg-slate-700 text-white px-6 py-2 rounded">Open Dashboard</a>
+    </div>
+  </div>
+
+<script>
+  const domain = "${domain}";
+  let mapping = {};
+
+  async function loadMapping() {
+    const res = await fetch("/mapping/" + domain);
+    const data = await res.json();
+    mapping = data.mapping || {};
+    renderRows();
+  }
+
+  function renderRows() {
+    const tbody = document.getElementById("mappingRows");
+    tbody.innerHTML = "";
+
+    const entries = Object.entries(mapping);
+    if (!entries.length) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="3" class="p-4 text-center text-gray-500">No mappings yet</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+
+    for (const [asana, canto] of entries) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = \`
+        <td class="p-3 border">
+          <input value="\${asana}" class="border p-2 w-full rounded" data-original="\${asana}" onchange="editAsana(this)">
+        </td>
+        <td class="p-3 border">
+          <input value="\${canto}" class="border p-2 w-full rounded" onchange="editCanto('\${asana}', this)">
+        </td>
+        <td class="p-3 border text-center">
+          <button onclick="deleteRow('\${asana}')" class="px-3 py-1 bg-red-600 text-white rounded">Delete</button>
+        </td>
+      \`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  function addRow() {
+    const asana = document.getElementById("newAsana").value.trim();
+    const canto = document.getElementById("newCanto").value.trim();
+    if (!asana || !canto) return alert("Both fields required");
+    mapping[asana] = canto;
+    document.getElementById("newAsana").value = "";
+    document.getElementById("newCanto").value = "";
+    renderRows();
+  }
+
+  function editAsana(input) {
+    const original = input.getAttribute("data-original");
+    const updated = input.value.trim();
+    if (!updated) { input.value = original; return; }
+    mapping[updated] = mapping[original];
+    delete mapping[original];
+    renderRows();
+  }
+
+  function editCanto(asana, input) {
+    mapping[asana] = input.value.trim();
+  }
+
+  function deleteRow(asana) {
+    delete mapping[asana];
+    renderRows();
+  }
+
+  async function saveMapping() {
+    const res = await fetch("/mapping/" + domain, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(mapping)
+    });
+    if (res.ok) {
+      alert("✅ Mapping saved!");
+    } else {
+      alert("❌ Failed to save mapping");
+    }
+  }
+
+  async function resetMapping() {
+    if (!confirm("Are you sure? This will delete all mappings.")) return;
+    const res = await fetch("/mapping/" + domain, { method: "DELETE" });
+    if (res.ok) {
+      mapping = {};
+      renderRows();
+      alert("✅ Mapping reset");
+    } else {
+      alert("❌ Failed to reset mapping");
+    }
+  }
+
+  loadMapping();
+</script>
+
+</body>
+</html>
+  `);
 });
 
 /* ================================================================
@@ -531,10 +678,14 @@ app.get("/status/:domain", async (req, res) => {
   const { domain } = req.params;
   try {
     const cantoToken = await getToken(domain);
-    const asanaToken = await getToken("asana"); // your app-wide Asana token bucket
+    const asanaToken = await getToken("asana");
 
     const mapping = cantoToken?.mapping || {};
-    const expiresAt = cantoToken?._expires_at || (cantoToken?.expires_in ? (Math.floor(Date.now()/1000) + Number(cantoToken.expires_in)) : null);
+    const expiresAt =
+      cantoToken?._expires_at ||
+      (cantoToken?.expires_in
+        ? Math.floor(Date.now() / 1000) + Number(cantoToken.expires_in)
+        : null);
 
     res.json({
       domain,
@@ -666,7 +817,6 @@ app.get("/dashboard/:domain", async (req, res) => {
       </div>
     </section>
 
-    <!-- Footer -->
     <footer class="text-sm text-gray-500">
       <p>Asana ↔ Canto Dashboard for <strong>${domain}</strong>. Powered by your Node.js integration.</p>
     </footer>
@@ -837,7 +987,6 @@ app.get("/dashboard/:domain", async (req, res) => {
 </body>
 </html>`);
 });
-
 
 /* ---------------------------------------------------------------
    START SERVER
