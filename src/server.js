@@ -521,6 +521,323 @@ app.get("/mapping-ui/:domain", async (req, res) => {
   // ... the entire mapping UI HTML code I gave you ...
 });
 
+/* ================================================================
+   STATUS API (used by Dashboard)
+   ---------------------------------------------------------------
+   GET /status/:domain
+   Returns: Canto token status, expiry, mapping count, Asana status
+================================================================ */
+app.get("/status/:domain", async (req, res) => {
+  const { domain } = req.params;
+  try {
+    const cantoToken = await getToken(domain);
+    const asanaToken = await getToken("asana"); // your app-wide Asana token bucket
+
+    const mapping = cantoToken?.mapping || {};
+    const expiresAt = cantoToken?._expires_at || (cantoToken?.expires_in ? (Math.floor(Date.now()/1000) + Number(cantoToken.expires_in)) : null);
+
+    res.json({
+      domain,
+      canto: {
+        connected: Boolean(cantoToken?.access_token),
+        expires_at: expiresAt,
+        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
+        has_refresh: Boolean(cantoToken?.refresh_token),
+      },
+      mapping: {
+        count: Object.keys(mapping).length,
+      },
+      asana: {
+        connected: Boolean(asanaToken?.access_token),
+      },
+    });
+  } catch (err) {
+    console.error("Status error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================================================================
+   FULL DASHBOARD UI (per-domain)
+   ---------------------------------------------------------------
+   Visit: /dashboard/:domain
+   Sections:
+     - Status (Canto & Asana)
+     - Mapping Manager
+     - Upload Tester (by URL + by File)
+================================================================ */
+app.get("/dashboard/:domain", async (req, res) => {
+  const { domain } = req.params;
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Asana ↔ Canto Dashboard – ${domain}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-900">
+
+  <div class="max-w-6xl mx-auto p-6">
+    <header class="mb-8 flex items-center justify-between">
+      <h1 class="text-3xl font-bold">
+        Asana ↔ Canto Dashboard <span class="text-indigo-600">(${domain})</span>
+      </h1>
+      <div class="flex gap-3">
+        <a href="/connect/canto" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700"
+           title="Reconnect Canto">Connect Canto</a>
+        <a href="/connect/asana" class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700"
+           title="Reconnect Asana">Connect Asana</a>
+      </div>
+    </header>
+
+    <!-- Status Cards -->
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
+      <div class="bg-white rounded-lg shadow p-5">
+        <h2 class="text-lg font-semibold mb-2">Canto Status</h2>
+        <p id="cantoConnected" class="mb-1">–</p>
+        <p id="cantoExpiry" class="mb-1">–</p>
+        <p id="cantoRefresh" class="mb-1">–</p>
+      </div>
+
+      <div class="bg-white rounded-lg shadow p-5">
+        <h2 class="text-lg font-semibold mb-2">Asana Status</h2>
+        <p id="asanaConnected" class="mb-1">–</p>
+        <p class="text-sm text-gray-500">Note: This is app-wide, not per-domain</p>
+      </div>
+
+      <div class="bg-white rounded-lg shadow p-5">
+        <h2 class="text-lg font-semibold mb-2">Mapping Status</h2>
+        <p id="mappingCount" class="mb-1">–</p>
+        <div class="flex gap-3">
+          <a href="/mapping-ui/${domain}" class="mt-2 px-3 py-2 bg-slate-700 text-white rounded hover:bg-slate-800">Open Mapping UI</a>
+          <button id="resetMappingBtn" class="mt-2 px-3 py-2 bg-red-600 text-white rounded hover:bg-red-700">Reset Mapping</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Mapping Manager (inline editor) -->
+    <section class="bg-white rounded-lg shadow p-6 mb-10">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xl font-semibold">Field Mapping (Asana → Canto)</h2>
+        <button id="saveMappingBtn" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Save Mapping</button>
+      </div>
+
+      <table class="w-full border mb-4">
+        <thead class="bg-gray-100">
+          <tr>
+            <th class="p-3 text-left">Asana Field</th>
+            <th class="p-3 text-left">Canto Field</th>
+            <th class="p-3 text-center">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="mappingRows"></tbody>
+      </table>
+
+      <div class="flex gap-3">
+        <input id="newAsana" class="border p-2 flex-1 rounded" placeholder="Asana Field Name" />
+        <input id="newCanto" class="border p-2 flex-1 rounded" placeholder="Canto Field Key" />
+        <button id="addRowBtn" class="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">Add</button>
+      </div>
+    </section>
+
+    <!-- Upload Tester -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
+      <!-- Upload by URL -->
+      <div class="bg-white rounded-lg shadow p-6">
+        <h2 class="text-xl font-semibold mb-4">Upload by URL</h2>
+        <div class="flex flex-col gap-3">
+          <input id="uploadUrl" class="border p-2 rounded" placeholder="https://example.com/file.jpg" />
+          <textarea id="uploadMeta" class="border p-2 rounded" rows="4" placeholder='Optional metadata JSON, e.g. {"Market":"US"}'></textarea>
+          <button id="uploadUrlBtn" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Upload URL → Canto</button>
+        </div>
+        <pre id="uploadUrlOut" class="mt-4 bg-gray-900 text-gray-100 p-3 rounded text-sm overflow-auto"></pre>
+      </div>
+
+      <!-- Upload by File -->
+      <div class="bg-white rounded-lg shadow p-6">
+        <h2 class="text-xl font-semibold mb-4">Upload a File</h2>
+        <div class="flex flex-col gap-3">
+          <input id="uploadFileInput" type="file" class="border p-2 rounded bg-gray-50" />
+          <button id="uploadFileBtn" class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700">Upload File → Canto</button>
+        </div>
+        <pre id="uploadFileOut" class="mt-4 bg-gray-900 text-gray-100 p-3 rounded text-sm overflow-auto"></pre>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="text-sm text-gray-500">
+      <p>Asana ↔ Canto Dashboard for <strong>${domain}</strong>. Powered by your Node.js integration.</p>
+    </footer>
+  </div>
+
+<script>
+  const domain = "${domain}";
+  let mapping = {};
+
+  // ---------------- Status ----------------
+  async function loadStatus() {
+    const r = await fetch("/status/" + domain);
+    const s = await r.json();
+
+    // Canto
+    document.getElementById("cantoConnected").textContent =
+      "Connected: " + (s.canto?.connected ? "Yes ✅" : "No ❌");
+    document.getElementById("cantoRefresh").textContent =
+      "Has refresh token: " + (s.canto?.has_refresh ? "Yes" : "No");
+
+    let expText = "Expires: –";
+    if (s.canto?.expires_at_iso) {
+      const dt = new Date(s.canto.expires_at_iso);
+      expText = "Expires: " + dt.toLocaleString();
+    }
+    document.getElementById("cantoExpiry").textContent = expText;
+
+    // Asana
+    document.getElementById("asanaConnected").textContent =
+      "Connected: " + (s.asana?.connected ? "Yes ✅" : "No ❌");
+
+    // Mapping
+    document.getElementById("mappingCount").textContent =
+      "Current mappings: " + (s.mapping?.count ?? 0);
+  }
+
+  // ---------------- Mapping ----------------
+  async function loadMapping() {
+    const res = await fetch("/mapping/" + domain);
+    const data = await res.json();
+    mapping = data.mapping || {};
+    renderRows();
+  }
+
+  function renderRows() {
+    const tbody = document.getElementById("mappingRows");
+    tbody.innerHTML = "";
+
+    const entries = Object.entries(mapping);
+    if (!entries.length) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="3" class="p-4 text-center text-gray-500">No mappings yet</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+
+    for (const [asana, canto] of entries) {
+      const tr = document.createElement("tr");
+
+      tr.innerHTML = \`
+        <td class="p-3 border"><input class="w-full border p-2 rounded" value="\${asana}" data-original="\${asana}" onchange="editAsana(this)" /></td>
+        <td class="p-3 border"><input class="w-full border p-2 rounded" value="\${canto}" onchange="editCanto('\${asana}', this)" /></td>
+        <td class="p-3 border text-center">
+          <button onclick="deleteRow('\${asana}')" class="px-2 py-1 bg-red-600 text-white rounded">Delete</button>
+        </td>
+      \`;
+
+      tbody.appendChild(tr);
+    }
+  }
+
+  window.editAsana = (input) => {
+    const original = input.getAttribute("data-original");
+    const val = input.value.trim();
+    if (!val) { input.value = original; return; }
+    mapping[val] = mapping[original];
+    delete mapping[original];
+    renderRows();
+  };
+
+  window.editCanto = (asana, input) => {
+    mapping[asana] = input.value.trim();
+  };
+
+  window.deleteRow = (asana) => {
+    delete mapping[asana];
+    renderRows();
+  };
+
+  document.getElementById("addRowBtn").addEventListener("click", () => {
+    const a = document.getElementById("newAsana").value.trim();
+    const c = document.getElementById("newCanto").value.trim();
+    if (!a || !c) return alert("Both fields required");
+    mapping[a] = c;
+    document.getElementById("newAsana").value = "";
+    document.getElementById("newCanto").value = "";
+    renderRows();
+  });
+
+  document.getElementById("saveMappingBtn").addEventListener("click", async () => {
+    const res = await fetch("/mapping/" + domain, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(mapping),
+    });
+    if (res.ok) {
+      alert("✅ Mapping saved");
+      loadStatus();
+    } else {
+      alert("❌ Failed to save mapping");
+    }
+  });
+
+  document.getElementById("resetMappingBtn").addEventListener("click", async () => {
+    if (!confirm("Reset all mappings for this domain?")) return;
+    const res = await fetch("/mapping/" + domain, { method: "DELETE" });
+    if (res.ok) {
+      mapping = {};
+      renderRows();
+      loadStatus();
+      alert("✅ Mapping reset");
+    } else {
+      alert("❌ Failed to reset mapping");
+    }
+  });
+
+  // ---------------- Upload by URL ----------------
+  document.getElementById("uploadUrlBtn").addEventListener("click", async () => {
+    const url = document.getElementById("uploadUrl").value.trim();
+    const metaText = document.getElementById("uploadMeta").value.trim();
+    if (!url) return alert("Provide a URL");
+
+    let metaObj = {};
+    if (metaText) {
+      try { metaObj = JSON.parse(metaText); } catch { return alert("Metadata must be valid JSON"); }
+    }
+
+    const r = await fetch("/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domain, attachmentUrl: url, metadata: metaObj }),
+    });
+
+    const t = await r.text();
+    document.getElementById("uploadUrlOut").textContent = t;
+    loadStatus();
+  });
+
+  // ---------------- Upload by File ----------------
+  document.getElementById("uploadFileBtn").addEventListener("click", async () => {
+    const input = document.getElementById("uploadFileInput");
+    if (!input.files || !input.files.length) return alert("Choose a file first");
+
+    const fd = new FormData();
+    fd.append("domain", domain);
+    fd.append("file", input.files[0]);
+
+    const r = await fetch("/test/upload-canto", { method: "POST", body: fd });
+    const t = await r.text();
+    document.getElementById("uploadFileOut").textContent = t;
+    loadStatus();
+  });
+
+  // Boot
+  loadStatus();
+  loadMapping();
+</script>
+</body>
+</html>`);
+});
+
 
 /* ---------------------------------------------------------------
    START SERVER
