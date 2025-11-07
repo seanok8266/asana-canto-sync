@@ -282,6 +282,41 @@ app.get("/oauth/callback/canto", async (req, res) => {
 });
 
 /* ================================================================
+   DEBUG: raw tenant /upload/setting inspector
+   Helps inspect the exact response shape from the tenant API
+================================================================ */
+app.get("/debug/upload-setting", async (req, res) => {
+  try {
+    const domain = (req.query.domain || "").toString().trim();
+    const filename = (req.query.filename || "Probe.jpg").toString();
+
+    if (!domain) {
+      return res.status(400).json({ error: "Missing ?domain=" });
+    }
+
+    const token = await refreshCantoTokenIfNeeded(domain);
+    if (!token?.access_token) {
+      return res.status(400).json({ error: "No Canto access token for domain" });
+    }
+
+    const base = tenantApiBase(domain);
+    const url = `${base}/api/v1/upload/setting?fileName=${encodeURIComponent(filename)}`;
+
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token.access_token}`,
+        Accept: "application/json"
+      },
+    });
+
+    const text = await r.text();
+    res.status(r.status).send(text);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================================================
    MAPPING API
 ================================================================ */
 app.get("/mapping/:domain", async (req, res) => {
