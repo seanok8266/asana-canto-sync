@@ -44,7 +44,20 @@ export async function saveToken(service, tokenData) {
 // ✅ This is what server.js needs
 export async function getToken(service) {
   const result = await pool.query(
-    `SELECT access_token, refresh_token, expires_in, token_type FROM tokens WHERE service = $1 LIMIT 1`,
+    `
+    SELECT 
+      service,
+      access_token,
+      refresh_token,
+      expires_in,
+      token_type,
+      domain,
+      mapping,
+      expires_at
+    FROM tokens 
+    WHERE service = $1 
+    LIMIT 1
+    `,
     [service]
   );
   return result.rows[0] || null;
