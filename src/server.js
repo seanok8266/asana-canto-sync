@@ -272,34 +272,46 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
    3) Poll search by S3 key
    4) Apply metadata via /files/{id}/metadata
 ================================================================ */
-async function cantoGetUploadSettingLegacy(domain, accessToken, { fileName }) {
-  const base = tenantApiBase(domain);
-  const url = new URL(`${base}/api/v1/upload/setting`);
-  if (fileName) url.searchParams.set("fileName", fileName);
+async function cantoGetUploadSetting(domain, accessToken, { filename }) {
+  const url = `https://${domain}.canto.com/api/v1/upload/setting`;
 
-  const r = await fetch(url.toString(), {
+  console.log("🔵 GET Upload Setting:", url);
+
+  const r = await fetch(url, {
     method: "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-    },
+      Accept: "application/json"
+    }
   });
 
   const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  console.log("📄 Upload Setting Response:", text);
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    console.error("❌ Upload setting not JSON:", text);
+    throw new Error("Upload setting was not JSON");
+  }
 
   if (!r.ok) {
-    console.error("[LEGACY upload/setting] HTTP", r.status, data);
-    throw new Error("legacy upload/setting failed");
+    console.error("❌ Upload setting error:", r.status, data);
+    throw new Error("Upload setting failed");
   }
 
-  // Canto often returns { uploadUrl, params: {...} } (multipart fields)
-  if (!data.uploadUrl || !data.params) {
-    console.error("[LEGACY upload/setting] missing fields:", data);
-    throw new Error("legacy upload/setting missing uploadUrl/params");
+  if (!data.uploadUrl || !data.fields) {
+    console.error("❌ Missing uploadUrl or fields:", data);
+    throw new Error("Upload setting missing required fields (uploadUrl, fields)");
   }
-  return data; // { uploadUrl, params: {...}, (maybe) key, path }
+
+  return {
+    uploadUrl: data.uploadUrl,
+    fields: data.fields
+  };
 }
+
 
 async function cantoS3MultipartPost(uploadUrl, params, fileBuffer, fileName, mimeType) {
   // Build multipart form with ALL fields from params + "file"
