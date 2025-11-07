@@ -482,65 +482,81 @@ async function s3MultipartPost(uploadUrl, fields, fileBuffer, fileName, mimeType
   }
 }
 
-async function cantoFindUploadedFileV2(domain, accessToken, { filename, s3Key }, { tries = 8, delayMs = 800 } = {}) {
+async function cantoFindUploadedFileV2(
+  domain,
+  accessToken,
+  { filename, s3Key },
+  { tries = 10, delayMs = 1000 } = {}
+) {
   const base = tenantApiBase(domain);
 
-  // Prefer searching by s3Key if we have it
+  function matches(item) {
+    if (!item) return false;
+
+    return (
+      item.originalName === filename ||
+      item.name === filename ||
+      item.original_filename === filename ||
+      item?.metadata?.original_filename === filename ||
+
+      // Some tenants return nested asset object
+      item?._embedded?.asset?.originalName === filename ||
+      item?._embedded?.asset?.name === filename ||
+      item?._embedded?.asset?.original_filename === filename ||
+
+      // fallback: sometimes Canto stores only basename
+      (item.key && item.key.endsWith("/" + filename))
+    );
+  }
+
+  // ✅ Try s3Key search first
   if (s3Key) {
     for (let i = 0; i < tries; i++) {
-      // Try POST search first (some tenants support body filter)
-      let r = await fetch(`${base}/api/v1/search`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({ filter: { s3Key } }),
-      });
+      let res;
+      try {
+        res = await fetch(`${base}/api/v1/search?s3Key=${encodeURIComponent(s3Key)}`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+      } catch {}
 
-      let text = await r.text();
-      let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+      if (res?.ok) {
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = {}; }
 
-      if (r.ok) {
-        const list = data.items || data.results;
-        if (Array.isArray(list) && list.length) return list[0];
+        const items = data.items || data.results || [];
+        if (items.length > 0) return items[0];
       }
 
-      // Fallback GET query param
-      r = await fetch(`${base}/api/v1/search?s3Key=${encodeURIComponent(s3Key)}`, {
-        headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
-      });
-
-      text = await r.text();
-      try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
-      if (r.ok && Array.isArray(data.items) && data.items.length) {
-        return data.items[0];
-      }
-      await new Promise(res => setTimeout(res, delayMs));
+      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 
-  // Last resort: poll recent and match by filename
+  // ✅ Try file-name based search (recent items)
   for (let i = 0; i < tries; i++) {
-    const r = await fetch(`${base}/api/v1/files/recent`, {
-      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
-    });
-    const text = await r.text();
-    let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    let res;
+    try {
+      res = await fetch(`${base}/api/v1/files/recent`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+    } catch {}
 
-    if (r.ok && Array.isArray(data.items)) {
-      const found = data.items.find(
-        x => x?.originalName === filename || x?.name === filename
-      );
-      if (found) return found;
+    if (res?.ok) {
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = {}; }
+
+      const list = data.items || [];
+      const item = list.find(matches);
+      if (item) return item;
     }
-    await new Promise(res => setTimeout(res, delayMs));
+
+    await new Promise(r => setTimeout(r, delayMs));
   }
 
   throw new Error("Uploaded file not found after polling");
 }
+
 
 async function cantoPatchMetadataV2(domain, accessToken, fileId, metadataObj) {
   const base = tenantApiBase(domain);
