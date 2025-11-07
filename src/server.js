@@ -664,6 +664,38 @@ app.post("/test/upload-canto", async (req, res) => {
 });
 
 /* ================================================================
+   STATUS API — ASANA (used by Dashboard to avoid domain=asana confusion)
+================================================================ */
+app.get("/status/asana", async (req, res) => {
+  try {
+    const t = await getToken("asana");
+    if (!t) {
+      return res.json({
+        asana: { connected: false },
+      });
+    }
+
+    const expiresAt =
+      t.expires_at ||
+      (t.expires_in
+        ? Math.floor(Date.now() / 1000) + Number(t.expires_in)
+        : null);
+
+    res.json({
+      asana: {
+        connected: Boolean(t.access_token),
+        expires_at: expiresAt,
+        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
+      },
+    });
+  } catch (err) {
+    console.error("Asana status error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+/* ================================================================
    STATUS API (for Dashboard)
 ================================================================ */
 app.get("/status/:domain", async (req, res) => {
@@ -720,37 +752,6 @@ app.get("/status/:domain", async (req, res) => {
     });
   } catch (err) {
     console.error("Status error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================================================================
-   STATUS API — ASANA (used by Dashboard to avoid domain=asana confusion)
-================================================================ */
-app.get("/status/asana", async (req, res) => {
-  try {
-    const t = await getToken("asana");
-    if (!t) {
-      return res.json({
-        asana: { connected: false },
-      });
-    }
-
-    const expiresAt =
-      t.expires_at ||
-      (t.expires_in
-        ? Math.floor(Date.now() / 1000) + Number(t.expires_in)
-        : null);
-
-    res.json({
-      asana: {
-        connected: Boolean(t.access_token),
-        expires_at: expiresAt,
-        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
-      },
-    });
-  } catch (err) {
-    console.error("Asana status error:", err);
     res.status(500).json({ error: err.message });
   }
 });
