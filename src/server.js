@@ -425,25 +425,43 @@ async function cantoGetUploadSettingV2(domain, accessToken, { filename }) {
   });
 
   const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  let raw; 
+  try { raw = JSON.parse(text); } 
+  catch { throw new Error("upload/setting did not return JSON"); }
 
   if (!r.ok) {
-    console.error("[v2 upload/setting] HTTP", r.status, data);
+    console.error("[v2 upload/setting] HTTP", r.status, raw);
     throw new Error("Canto v2 upload/setting failed");
   }
 
-  // Most tenants return: { uploadUrl, fields: {key, ...} }
-  // Some older ones: { uploadUrl, params: {...} }
-  const fields = data.fields || data.params;
-  if (!data.uploadUrl || !fields) {
-    console.error("[v2 upload/setting] missing uploadUrl/fields:", data);
+  // ✅ Your tenant uses:
+  //   url = upload URL
+  //   key = key prefix
+  //   other properties = multipart fields
+  if (raw.url && raw.key && raw.Policy) {
+    const { url: uploadUrl, key, ...rest } = raw;
+
+    const fields = {
+      ...rest,
+      key,
+      // substitute ${filename}
+      "x-amz-meta-file_name": filename,
+    };
+
+    return { uploadUrl, fields, s3Key: key.replace("${filename}", filename) };
+  }
+
+  // ✅ Standard v2 handling (fallback)
+  const fields = raw.fields || raw.params;
+  if (!raw.uploadUrl || !fields) {
+    console.error("[v2 upload/setting] missing uploadUrl/fields:", raw);
     throw new Error("Canto v2 upload/setting incomplete response");
   }
 
-  // try to surface s3Key (usually fields.key)
-  const s3Key = fields.key || data.key || null;
-  return { uploadUrl: data.uploadUrl, fields, s3Key };
+  const s3Key = fields.key || raw.key || null;
+  return { uploadUrl: raw.uploadUrl, fields, s3Key };
 }
+
 
 async function s3MultipartPost(uploadUrl, fields, fileBuffer, fileName, mimeType) {
   const form = new FormData();
