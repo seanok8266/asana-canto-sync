@@ -14,10 +14,15 @@ export async function initDB() {
       access_token TEXT,
       refresh_token TEXT,
       expires_in INTEGER,
-      token_type TEXT
+      token_type TEXT,
+      domain TEXT,
+      asana_projects TEXT[],
+      mapping JSONB DEFAULT '{}'::jsonb,
+      expires_at BIGINT
     );
   `);
 }
+
 
 // Save token for a service ("asana" or "canto")
 export async function saveToken(service, tokenData) {
