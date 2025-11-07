@@ -889,20 +889,48 @@ app.get("/status/:domain", async (req, res) => {
     const asanaToken = await getToken("asana");
 
     const mapping = cantoToken?.mapping || {};
+
+    // ✅ Expiry calculation (unchanged)
     const expiresAt =
       cantoToken?._expires_at ||
       (cantoToken?.expires_in
         ? Math.floor(Date.now() / 1000) + Number(cantoToken.expires_in)
         : null);
 
+    // ✅ Detect upload workflow version on-demand
+    let uploadVersion = null;
+
+    if (cantoToken?.access_token && domain) {
+      const uploadSettingUrl = `https://${domain}.canto.com/api/v1/upload/setting`;
+
+      try {
+        const resp = await fetch(uploadSettingUrl, {
+          headers: {
+            Authorization: `Bearer ${cantoToken.access_token}`
+          }
+        });
+
+        if (resp.ok) {
+          uploadVersion = "v2";   // ✅ this tenant supports the new upload workflow
+        } else {
+          uploadVersion = "legacy";
+        }
+      } catch (err) {
+        uploadVersion = "legacy";
+      }
+    }
+
+    // ✅ Return enriched status JSON
     res.json({
       domain,
       canto: {
         connected: Boolean(cantoToken?.access_token),
         expires_at: expiresAt,
-        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
+        expires_at_iso: expiresAt
+          ? new Date(expiresAt * 1000).toISOString()
+          : null,
         has_refresh: Boolean(cantoToken?.refresh_token),
-        uploadVersion: cantoToken?.uploadVersion || null,
+        uploadVersion        // ✅ NEW DYNAMIC FIELD
       },
       mapping: {
         count: Object.keys(mapping).length,
@@ -916,6 +944,7 @@ app.get("/status/:domain", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 /* ================================================================
    FULL DASHBOARD UI (per-domain)
@@ -1027,26 +1056,34 @@ app.get("/dashboard/:domain", async (req, res) => {
   let mapping = {};
 
   async function loadStatus() {
-    const r = await fetch("/status/" + domain);
-    const s = await r.json();
+  const rDomain = await fetch("/status/" + domain);
+  const sDomain = await rDomain.json();
 
-    // Canto
-    document.getElementById("cantoConnected").textContent =
-      "Connected: " + (s.canto?.connected ? "Yes ✅" : "No ❌");
-    document.getElementById("cantoRefresh").textContent =
-      "Has refresh token: " + (s.canto?.has_refresh ? "Yes" : "No");
+  const rAsana = await fetch("/status/asana");
+  const sAsana = await rAsana.json();
 
-    let expText = "Expires: –";
-    if (s.canto?.expires_at_iso) {
-      const dt = new Date(s.canto.expires_at_iso);
-      expText = "Expires: " + dt.toLocaleString();
-    }
-    document.getElementById("cantoExpiry").textContent = expText;
+  // Canto
+  document.getElementById("cantoConnected").textContent =
+    "Connected: " + (sDomain.canto?.connected ? "Yes ✅" : "No ❌");
+  document.getElementById("cantoRefresh").textContent =
+    "Has refresh token: " + (sDomain.canto?.has_refresh ? "Yes" : "No");
 
-    // Mapping
-    document.getElementById("mappingCount").textContent =
-      "Current mappings: " + (s.mapping?.count ?? 0);
+  let expText = "Expires: –";
+  if (sDomain.canto?.expires_at_iso) {
+    const dt = new Date(sDomain.canto.expires_at_iso);
+    expText = "Expires: " + dt.toLocaleString();
   }
+  document.getElementById("cantoExpiry").textContent = expText;
+
+  // ✅ Asana (now correct)
+  document.getElementById("asanaConnected").textContent =
+    "Connected: " + (sAsana.asana?.connected ? "Yes ✅" : "No ❌");
+
+  // Mapping
+  document.getElementById("mappingCount").textContent =
+    "Current mappings: " + (sDomain.mapping?.count ?? 0);
+}
+
 
   async function loadMapping() {
     const res = await fetch("/mapping/" + domain);
