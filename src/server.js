@@ -664,22 +664,22 @@ app.post("/test/upload-canto", async (req, res) => {
 });
 
 /* ================================================================
-   STATUS API — ASANA (used by Dashboard to avoid domain=asana confusion)
+   STATUS API — ASANA (Dashboard uses this to avoid domain=asana)
 ================================================================ */
 app.get("/status/asana", async (req, res) => {
   try {
     const t = await getToken("asana");
+
     if (!t) {
       return res.json({
         asana: { connected: false },
       });
     }
 
+    // Always prefer DB-stored expires_at
     const expiresAt =
       t.expires_at ||
-      (t.expires_in
-        ? Math.floor(Date.now() / 1000) + Number(t.expires_in)
-        : null);
+      (t.expires_in ? nowSec() + Number(t.expires_in) : null);
 
     res.json({
       asana: {
@@ -696,41 +696,40 @@ app.get("/status/asana", async (req, res) => {
 
 
 /* ================================================================
-   STATUS API (for Dashboard)
+   STATUS API (full dashboard)
 ================================================================ */
 app.get("/status/:domain", async (req, res) => {
   const { domain } = req.params;
+
   try {
     const cantoToken = await getToken(domain);
     const asanaToken = await getToken("asana");
 
     const mapping = cantoToken?.mapping || {};
 
-    // Expiry from DB or computed
+    // ✅ ALWAYS use expires_at (no _expires_at)
     const expiresAt =
-      cantoToken?._expires_at ||
+      cantoToken?.expires_at ||
       (cantoToken?.expires_in
-        ? Math.floor(Date.now() / 1000) + Number(cantoToken.expires_in)
+        ? nowSec() + Number(cantoToken.expires_in)
         : null);
 
-    // Try to determine upload version (cache or live ping)
+    // Upload version detection (cached or ping)
     let uploadVersion = cantoToken?.uploadVersion || null;
 
     if (!uploadVersion && cantoToken?.access_token) {
-      // Try legacy endpoint to see if v2 is enabled
       const url = `https://${domain}.canto.com/api/v1/upload/setting`;
 
       try {
         const resp = await fetch(url, {
           headers: { Authorization: `Bearer ${cantoToken.access_token}` },
         });
-        if (resp.ok) uploadVersion = "v2";
-        else uploadVersion = "v3";
+
+        uploadVersion = resp.ok ? "v2" : "v3";
       } catch {
         uploadVersion = "v3";
       }
 
-      // Save to DB for future calls
       await persistCantoRecord(domain, { uploadVersion });
     }
 
@@ -755,6 +754,7 @@ app.get("/status/:domain", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 /* ================================================================
    FULL DASHBOARD UI (per-domain)
