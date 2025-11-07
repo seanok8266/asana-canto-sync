@@ -1062,7 +1062,10 @@ app.get("/dashboard/:domain", async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ domain: domain, attachmentUrl: url, metadata: metadata }),
       });
-      document.getElementById("uploadUrlOut").textContent = await r.text();
+      const txt = await r.text();
+document.getElementById("uploadUrlOut").textContent =
+  txt && txt.trim() !== "" ? txt : "✅ Upload completed successfully (no body returned)";
+
       loadStatus();
     } catch {
       document.getElementById("uploadUrlOut").textContent = "Request failed.";
@@ -1079,7 +1082,10 @@ app.get("/dashboard/:domain", async (req, res) => {
 
     try {
       const r = await fetch("/test/upload-canto", { method: "POST", body: fd });
-      document.getElementById("uploadFileOut").textContent = await r.text();
+      const txt = await r.text();
+document.getElementById("uploadFileOut").textContent =
+  txt && txt.trim() !== "" ? txt : "✅ File upload completed successfully (no body returned)";
+
       loadStatus();
     } catch {
       document.getElementById("uploadFileOut").textContent = "Upload failed.";
