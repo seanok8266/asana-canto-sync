@@ -583,6 +583,14 @@ app.get("/oauth/callback/canto", async (req, res) => {
    UPLOAD (Auto-detect per-domain flow)
    - Accepts: { attachmentUrl, domain, metadata? }
 ---------------------------------------------------------------- */
+/* ---------------------------------------------------------------
+   UPLOAD TO CANTO — NEW V2 FLOW
+   ---------------------------------------------------------------
+   1. GET /api/v1/upload/setting  (Canto)
+   2. POST multipart/form-data to S3 (uploadUrl + fields)
+   3. Poll /api/v1/files/recent to find new file
+   4. PATCH metadata onto file
+--------------------------------------------------------------- */
 app.post("/upload", async (req, res) => {
   const { attachmentUrl, domain, metadata } = req.body;
 
@@ -590,86 +598,137 @@ app.post("/upload", async (req, res) => {
   if (!attachmentUrl) return res.status(400).json({ error: "Missing attachmentUrl" });
 
   try {
-    // 0) token + detect
+    // 1️⃣ Refresh token
     let tokenData = await refreshCantoTokenIfNeeded(domain);
-    if (!tokenData?.access_token) return res.status(400).json({ error: "Canto token not found" });
+    if (!tokenData?.access_token) {
+      return res.status(400).json({ error: "Canto token not found" });
+    }
 
-    let uploadVersion = (await getToken(domain))?.uploadVersion;
-    if (!uploadVersion) uploadVersion = await detectUploadVersion(domain, tokenData.access_token);
-
-    // 1) download bytes
+    // 2️⃣ Download file from attachment URL
     const dl = await fetch(attachmentUrl);
     if (!dl.ok) {
-      const t = await dl.text();
-      return res.status(400).json({ error: "Failed to download attachment", details: t });
+      return res.status(400).json({
+        error: "Failed to download attachment",
+        status: dl.status,
+        text: await dl.text(),
+      });
     }
+
     const mimeType = dl.headers.get("content-type") || "application/octet-stream";
     const buf = Buffer.from(await dl.arrayBuffer());
-    const fileName = filenameFromUrl(attachmentUrl);
 
-    // 2) parse metadata & map
+    // Extract filename from URL
+    const filename = filenameFromUrl(attachmentUrl);
+
+    // Parse metadata
     let metaObj = {};
-    if (metadata && typeof metadata === "string") { try { metaObj = JSON.parse(metadata); } catch {} }
-    else if (metadata && typeof metadata === "object") { metaObj = metadata; }
-
-    const domainMapping = await getDomainMapping(domain);
-    const mappedMeta = applyFieldMapping(domainMapping, metaObj);
-
-    // 3) branch by uploadVersion
-    if (uploadVersion === "legacy") {
-      // LEGACY: upload/setting → multipart POST → search s3Key → metadata
-      const setting = await cantoGetUploadSettingLegacy(domain, tokenData.access_token, { fileName });
-      const s3Key = (setting.params && setting.params.key) || setting.key;
-      if (!s3Key) {
-        throw new Error("upload/setting did not return S3 key");
+    try {
+      if (typeof metadata === "string") {
+        metaObj = JSON.parse(metadata);
+      } else if (typeof metadata === "object") {
+        metaObj = metadata;
       }
+    } catch { metaObj = {}; }
 
-      await cantoS3MultipartPost(setting.uploadUrl, setting.params, buf, fileName, mimeType);
+    // Apply domain mapping
+    const mapping = await getDomainMapping(domain);
+    const mappedMetadata = applyFieldMapping(mapping, metaObj);
 
-      const uploaded = await cantoSearchByS3Key(domain, tokenData.access_token, s3Key, { tries: 10, delayMs: 800 });
+    // 3️⃣ Get upload setting from Canto
+    const { uploadUrl, fields } = await cantoGetUploadSetting(domain, tokenData.access_token);
 
-      const fileId = uploaded.id || uploaded.fileId || uploaded.gid || uploaded.assetId;
-      let mdResp = { skipped: true };
-      if (fileId && Object.keys(mappedMeta).length) {
-        mdResp = await cantoApplyMetadataLegacy(domain, tokenData.access_token, fileId, mappedMeta);
-      }
+    // 4️⃣ Build multipart form POST to S3
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) {
+      form.append(k, v);
+    }
+    form.append("file", buf, { filename, contentType: mimeType });
 
-      return res.json({
-        ok: true,
-        version: "legacy",
-        domain,
-        filename: fileName,
-        fileId: fileId || null,
-        metadataApplied: mdResp,
-        found: uploaded,
-      });
-    } else {
-      // V3: /uploads → PUT → /files (metadata here)
-      const created = await cantoCreateUploadV3(tokenData.access_token, {
-        filename: fileName, size: buf.length, mimeType,
-      });
-      await cantoPutToS3Put(created.uploadUrl, buf, mimeType);
-      const file = await cantoFinalizeFileV3(tokenData.access_token, {
-        uploadId: created.uploadId,
-        filename: fileName,
-        metadata: mappedMeta,
-      });
+    // 5️⃣ Upload to S3
+    const s3Resp = await fetch(uploadUrl, {
+      method: "POST",
+      body: form,
+    });
 
-      const assetUrl = file?.url || file?.publicUrl || file?.links?.view || null;
-      return res.json({
-        ok: true,
-        version: "v3",
-        domain,
-        filename: fileName,
-        assetUrl,
-        cantoFile: file,
+    if (!s3Resp.ok) {
+      const txt = await s3Resp.text();
+      console.error("❌ S3 Upload Failed:", s3Resp.status, txt);
+      return res.status(500).json({
+        error: "S3 upload failed",
+        status: s3Resp.status,
+        body: txt,
       });
     }
+
+    // 6️⃣ Poll Canto for new file (3–5 seconds max)
+    const recentUrl = `https://${domain}.canto.com/api/v1/files/recent`;
+
+    let found = null;
+    for (let i = 0; i < 6; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+
+      const r = await fetch(recentUrl, {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); } catch {
+        console.error("❌ Non-JSON from recent:", text);
+        continue;
+      }
+
+      if (Array.isArray(data?.items)) {
+        found = data.items.find(
+          f => f.originalName === filename || f.name === filename
+        );
+        if (found) break;
+      }
+    }
+
+    if (!found) {
+      return res.status(500).json({ error: "File uploaded but not found in Canto recent list" });
+    }
+
+    // 7️⃣ PATCH metadata onto file
+    const patchUrl = `https://${domain}.canto.com/api/v1/files/${found.id}`;
+
+    const patchResp = await fetch(patchUrl, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ metadata: mappedMetadata }),
+    });
+
+    const patchText = await patchResp.text();
+    let patchData;
+    try { patchData = JSON.parse(patchText); }
+    catch { patchData = { raw: patchText }; }
+
+    if (!patchResp.ok) {
+      return res.status(500).json({
+        error: "Metadata patch failed",
+        status: patchResp.status,
+        body: patchData,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      filename,
+      domain,
+      cantoFileId: found.id,
+      cantoFile: patchData,
+    });
+
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
+
 
 /* ---------------------------------------------------------------
    TEST RAW FILE UPLOAD (multipart) — Uses same auto-detect flow
