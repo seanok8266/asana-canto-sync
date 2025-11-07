@@ -1,14 +1,11 @@
 /********************************************************************
- *  Asana ↔ Canto Sync Service (Clean rewrite, dual upload support)
+ *  Asana ↔ Canto Sync Service (Clean Unified Version)
  *  ---------------------------------------------------------------
  *  ✅ Asana OAuth
- *  ✅ Canto OAuth + refresh
- *  ✅ Auto-detect per-domain upload API: 'legacy' (v2) vs 'v3'
- *  ✅ Legacy flow: GET upload/setting → multipart S3 → poll → PATCH metadata
- *  ✅ V3 flow:     POST /uploads → PUT S3 → POST /files (+metadata)
- *  ✅ Per-domain metadata mapping API (/mapping/:domain)
- *  ✅ Dashboard (/dashboard/:domain) + Mapping UI
- *  ✅ Uses your db.js (initDB / getToken / saveToken), extras cached in-memory
+ *  ✅ Canto OAuth + Refresh
+ *  ✅ Unified Upload Dispatcher (v2 + v3 auto-detect)
+ *  ✅ Mapping UI + Dashboard
+ *  ✅ Test Upload Endpoints
  ********************************************************************/
 
 import express from "express";
@@ -20,73 +17,74 @@ import { Buffer } from "buffer";
 import { initDB, saveToken, getToken } from "./db.js";
 
 dotenv.config();
-
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "30mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 /* ================================================================
    CONSTANTS
 ================================================================ */
-const OAUTH_BASE = "https://oauth.canto.com"; // auth/token host
-const CANTO_AUTH_URL  = `${OAUTH_BASE}/oauth/api/oauth2/compatible/authorize`;
-const CANTO_TOKEN_URL = `${OAUTH_BASE}/oauth/api/oauth2/compatible/token`;
-// v3-only endpoints (reside on oauth host):
-const CANTO_UPLOADS_URL_V3 = `${OAUTH_BASE}/api/v1/uploads`;
-const CANTO_FILES_URL_V3   = `${OAUTH_BASE}/api/v1/files`;
+const CANTO_OAUTH_BASE = "https://oauth.canto.com";
+const CANTO_AUTH_URL   = `${CANTO_OAUTH_BASE}/oauth/api/oauth2/compatible/authorize`;
+const CANTO_TOKEN_URL  = `${CANTO_OAUTH_BASE}/oauth/api/oauth2/compatible/token`;
+
+const CANTO_UPLOADS_URL_V3 = `${CANTO_OAUTH_BASE}/api/v1/uploads`;
+const CANTO_FILES_URL_V3   = `${CANTO_OAUTH_BASE}/api/v1/files`;
 
 /* ================================================================
-   IN-MEMORY CACHE
+   HELPERS — General
 ================================================================ */
-const memory = {
-  canto: {
-    // domain -> token record (last seen)
-  },
-  uploadVersion: {
-    // domain -> "legacy" | "v3"
-  },
-};
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function tenantApiBase(domain) {
+  const d = domain.replace(/^https?:\/\//, "").replace(/\.canto\.com$/, "");
+  return `https://${d}.canto.com`;
+}
+
+function filenameFromUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    const parts = u.pathname.split("/");
+    return decodeURIComponent(parts.pop()) || `file-${Date.now()}`;
+  } catch {
+    return `file-${Date.now()}`;
+  }
+}
 
 /* ================================================================
-   HELPERS (generic)
+   TOKEN HELPERS
 ================================================================ */
-const nowSec = () => Math.floor(Date.now() / 1000);
-
-function tenantBase(domain) {
-  // accepts "thedamconsultants" or a full host
-  const clean = String(domain)
-    .replace(/^https?:\/\//, "")
-    .replace(/\.canto\.com$/i, "");
-  return `https://${clean}.canto.com`;
+async function persistCantoRecord(domain, patch) {
+  const current = (await getToken(domain)) || {};
+  const next = { ...current, ...patch, domain };
+  await saveToken(domain, next);
+  return next;
 }
 
 async function persistCantoToken(domain, tokenData) {
-  const rec = {
-    ...tokenData,
-    domain,
-    _expires_at: nowSec() + Number(tokenData.expires_in || 3500),
-  };
-  memory.canto[domain] = rec;
-  await saveToken(domain, rec); // harmless if db.js ignores some fields
-  return rec;
+  tokenData.domain = domain;
+  tokenData._expires_at = nowSec() + Number(tokenData.expires_in || 3500);
+  await saveToken(domain, tokenData);
 }
 
-async function getCantoRecord(domain) {
-  // merge DB + memory
-  const fromDb = await getToken(domain);
-  const inMem = memory.canto[domain];
-  return { ...(fromDb || {}), ...(inMem || {}) };
+async function loadCantoToken(domain) {
+  return await getToken(domain);
 }
 
 async function refreshCantoTokenIfNeeded(domain) {
-  const td = await getCantoRecord(domain);
-  if (!td?.access_token) throw new Error("No Canto token for domain " + domain);
+  let td = await loadCantoToken(domain);
+  if (!td?.access_token) throw new Error("No Canto token for " + domain);
 
   const now = nowSec();
-  const exp = td._expires_at || (td.expires_in ? now + Number(td.expires_in) : null);
-  if (exp && exp - now > 60) return td; // still fresh
+  if (!td._expires_at && td.expires_in) {
+    td._expires_at = now + Number(td.expires_in);
+    await persistCantoRecord(domain, td);
+  }
 
-  if (!td.refresh_token) return td; // nothing we can do
+  if (td._expires_at - now > 60) return td;
+  if (!td.refresh_token) return td;
 
   const params = new URLSearchParams({
     grant_type: "refresh_token",
@@ -98,321 +96,97 @@ async function refreshCantoTokenIfNeeded(domain) {
   const resp = await fetch(CANTO_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params,
+    body: params
   });
 
   const raw = await resp.text();
   let data;
-  try { data = JSON.parse(raw); } catch { throw new Error("Canto refresh returned non-JSON"); }
+  try { data = JSON.parse(raw); } catch {
+    throw new Error("Non-JSON refresh response");
+  }
 
   if (!resp.ok || data.error) {
     console.error("Canto refresh failed:", data);
     return td;
   }
-  return persistCantoToken(domain, { ...td, ...data });
-}
 
-function filenameFromUrl(urlStr) {
-  try {
-    const url = new URL(urlStr);
-    const parts = url.pathname.split("/");
-    return decodeURIComponent(parts.pop() || `file-${Date.now()}`);
-  } catch {
-    return `file-${Date.now()}`;
-  }
+  const merged = {
+    ...td,
+    ...data,
+    _expires_at: nowSec() + Number(data.expires_in || 3500)
+  };
+
+  await persistCantoRecord(domain, merged);
+  return merged;
 }
 
 /* ================================================================
    FIELD MAPPING HELPERS
 ================================================================ */
 async function getDomainMapping(domain) {
-  const tokenRecord = await getToken(domain);
-  return tokenRecord?.mapping || {};
+  const t = await getToken(domain);
+  return t?.mapping || {};
 }
 
 async function saveDomainMapping(domain, mapping) {
-  // best-effort persistence via saveToken (extra fields may be ignored by your db.js)
-  const current = (await getToken(domain)) || {};
-  const patched = { ...current, mapping };
-  await saveToken(domain, patched);
-  // keep in-memory too:
-  memory.canto[domain] = { ...(memory.canto[domain] || {}), ...patched, domain };
+  const t = (await getToken(domain)) || {};
+  t.mapping = mapping;
+  await saveToken(domain, t);
   return mapping;
 }
 
 function applyFieldMapping(mapping, metadata) {
   const out = { ...metadata };
-  for (const [asanaField, cantoField] of Object.entries(mapping || {})) {
-    if (Object.prototype.hasOwnProperty.call(metadata, asanaField)) {
-      out[cantoField] = metadata[asanaField];
+  for (const [asanaKey, cantoKey] of Object.entries(mapping || {})) {
+    if (metadata.hasOwnProperty(asanaKey)) {
+      out[cantoKey] = metadata[asanaKey];
     }
   }
   return out;
 }
 
 /* ================================================================
-   UPLOAD VERSION DETECTION (per-domain)
-   - Try legacy GET {tenant}/api/v1/upload/setting
-   - If 200 + expected fields -> "legacy"
-   - Else fallback to "v3"
+   DETECT UPLOAD VERSION PER DOMAIN (v2 or v3)
 ================================================================ */
 async function detectUploadVersion(domain, accessToken) {
-  // prefer cached
-  if (memory.uploadVersion[domain]) return memory.uploadVersion[domain];
+  const existing = await getToken(domain);
+  if (existing?.uploadVersion) return existing.uploadVersion;
 
+  // Try v2 first (upload/setting)
   try {
-    const url = new URL(`${tenantBase(domain)}/api/v1/upload/setting`);
-    url.searchParams.set("fileName", "probe.txt"); // harmless hint
-
-    const r = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/json",
-      },
+    const url = `${tenantApiBase(domain)}/api/v1/upload/setting`;
+    const r = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` }
     });
-
-    const text = await r.text();
-    let data; try { data = JSON.parse(text); } catch { data = {}; }
-
-    if (r.ok && (data.uploadUrl || data.fields || data.params)) {
-      memory.uploadVersion[domain] = "legacy";
-      // best-effort persist (ignored if db.js doesn't store it)
-      await saveToken(domain, { ...(await getToken(domain)), uploadVersion: "legacy" });
-      return "legacy";
+    if (r.ok) {
+      await persistCantoRecord(domain, { uploadVersion: "v2" });
+      return "v2";
     }
-  } catch (_) { /* ignore */ }
+  } catch {}
 
-  memory.uploadVersion[domain] = "v3";
-  await saveToken(domain, { ...(await getToken(domain)), uploadVersion: "v3" });
+  // Otherwise assume v3
+  await persistCantoRecord(domain, { uploadVersion: "v3" });
   return "v3";
 }
 
 /* ================================================================
-   LEGACY (v2) HELPERS
-   1) GET {tenant}/api/v1/upload/setting
-   2) POST multipart to S3 (uploadUrl + *fields*)
-   3) Poll recent
-   4) PATCH metadata
+   ASANA OAUTH
 ================================================================ */
-async function cantoGetUploadSettingLegacy(domain, accessToken, { fileName }) {
-  const url = new URL(`${tenantBase(domain)}/api/v1/upload/setting`);
-  if (fileName) url.searchParams.set("fileName", fileName);
-
-  const r = await fetch(url.toString(), {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-    },
-  });
-
-  const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = {}; }
-
-  if (!r.ok) {
-    console.error("[legacy upload/setting] HTTP", r.status, text);
-    throw new Error("legacy upload/setting failed");
-  }
-
-  // Some tenants return { uploadUrl, fields: {...} }, older docs called it "params"
-  const fields = data.fields || data.params;
-  if (!data.uploadUrl || !fields) {
-    console.error("[legacy upload/setting] missing uploadUrl/fields:", data);
-    throw new Error("legacy upload/setting missing fields");
-  }
-  return { uploadUrl: data.uploadUrl, fields, key: fields.key || data.key || null };
-}
-
-async function s3MultipartPost(uploadUrl, fields, fileBuffer, fileName, mimeType) {
-  const form = new FormData();
-  for (const [k, v] of Object.entries(fields)) form.append(k, String(v));
-  form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
-
-  const r = await fetch(uploadUrl, { method: "POST", headers: form.getHeaders(), body: form });
-  // S3 often returns 204/201
-  if (![200, 201, 204].includes(r.status)) {
-    const t = await r.text();
-    console.error("[S3 multipart POST] failed:", r.status, t);
-    throw new Error("S3 multipart POST failed");
-  }
-}
-
-async function pollRecentForFile(domain, accessToken, { filename, tries = 8, delayMs = 800 }) {
-  const recentUrl = `${tenantBase(domain)}/api/v1/files/recent`;
-
-  for (let i = 0; i < tries; i++) {
-    const r = await fetch(recentUrl, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
-    });
-
-    const text = await r.text();
-    let data; try { data = JSON.parse(text); } catch { data = {}; }
-    if (Array.isArray(data?.items)) {
-      const found = data.items.find(
-        f => f.originalName === filename || f.name === filename
-      );
-      if (found) return found;
-    }
-    await new Promise(res => setTimeout(res, delayMs));
-  }
-  throw new Error("Uploaded file not found in recent list");
-}
-
-async function applyMetadataLegacy(domain, accessToken, fileId, metadata) {
-  // Some tenants use PATCH /files/{id}, others /files/{id}/metadata
-  // 1) Try PATCH /files/{id} with { metadata }
-  const url1 = `${tenantBase(domain)}/api/v1/files/${encodeURIComponent(fileId)}`;
-  let r = await fetch(url1, {
-    method: "PATCH",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ metadata: metadata || {} }),
-  });
-
-  if (r.status === 404 || r.status === 405) {
-    // 2) Fall back to POST/PATCH /files/{id}/metadata
-    const url2 = `${tenantBase(domain)}/api/v1/files/${encodeURIComponent(fileId)}/metadata`;
-    r = await fetch(url2, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(metadata || {}),
-    });
-  }
-
-  const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = {}; }
-  if (!r.ok) {
-    console.error("[legacy metadata] HTTP", r.status, data);
-    throw new Error("Metadata update failed (legacy)");
-  }
-  return data;
-}
-
-/* ================================================================
-   V3 HELPERS
-   POST /uploads → PUT S3 → POST /files (+metadata)
-================================================================ */
-async function v3CreateUpload(accessToken, { filename, size, mimeType }) {
-  const r = await fetch(CANTO_UPLOADS_URL_V3, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ filename, size, mimeType }),
-  });
-
-  const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = {}; }
-
-  if (!r.ok || !data.uploadId || !data.uploadUrl) {
-    console.error("[v3 /uploads] HTTP", r.status, data);
-    throw new Error("Canto v3 /uploads failed");
-  }
-  return data; // { uploadId, uploadUrl }
-}
-
-async function s3Put(uploadUrl, bytes, mimeType) {
-  const r = await fetch(uploadUrl, {
-    method: "PUT",
-    headers: {
-      "Content-Type": mimeType || "application/octet-stream",
-      "Content-Length": String(bytes.length),
-    },
-    body: bytes,
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    console.error("[S3 PUT] failed:", r.status, t);
-    throw new Error("PUT to signed URL failed");
-  }
-}
-
-async function v3FinalizeFile(accessToken, { uploadId, filename, metadata }) {
-  const r = await fetch(CANTO_FILES_URL_V3, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ uploadId, filename, metadata }),
-  });
-
-  const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = {}; }
-
-  if (!r.ok) {
-    console.error("[v3 /files] HTTP", r.status, data);
-    throw new Error("Canto v3 /files failed");
-  }
-  return data;
-}
-
-/* ================================================================
-   UNIFIED UPLOAD
-================================================================ */
-async function uploadToCanto({ domain, accessToken, bytes, filename, mimeType, metadata }) {
-  // detect & cache version
-  const version = await detectUploadVersion(domain, accessToken);
-
-  // apply mapping before hitting API
-  const mapping = await getDomainMapping(domain);
-  const mapped = applyFieldMapping(mapping, metadata || {});
-
-  if (version === "legacy") {
-    // 1) upload setting
-    const setting = await cantoGetUploadSettingLegacy(domain, accessToken, { fileName: filename });
-    // 2) S3 multipart
-    await s3MultipartPost(setting.uploadUrl, setting.fields, bytes, filename, mimeType);
-    // 3) find recent
-    const found = await pollRecentForFile(domain, accessToken, { filename });
-    // 4) metadata
-    const patched = await applyMetadataLegacy(domain, accessToken, found.id, mapped);
-    return { version, fileId: found.id, file: patched };
-  }
-
-  // v3 path
-  const created = await v3CreateUpload(accessToken, { filename, size: bytes.length, mimeType });
-  await s3Put(created.uploadUrl, bytes, mimeType);
-  const finalized = await v3FinalizeFile(accessToken, {
-    uploadId: created.uploadId,
-    filename,
-    metadata: mapped,
-  });
-  return { version, fileId: finalized?.id, file: finalized };
-}
-
-/* ================================================================
-   ROUTES
-================================================================ */
-
-app.get("/", (_req, res) => res.send("Asana ↔ Canto Sync Service Running ✅"));
-
-/* ---------------- Asana OAuth ---------------- */
-app.get("/connect/asana", (_req, res) => {
-  const authUrl =
+app.get("/connect/asana", (req, res) => {
+  const url =
     `https://app.asana.com/-/oauth_authorize?client_id=${process.env.ASANA_CLIENT_ID}` +
     `&redirect_uri=${encodeURIComponent(process.env.ASANA_REDIRECT_URI)}` +
     `&response_type=code`;
-  res.redirect(authUrl);
+
+  res.redirect(url);
 });
 
 app.get("/oauth/callback/asana", async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.status(400).send("Missing authorization code");
+  if (!code) return res.status(400).send("Missing code");
+
   try {
-    const tokenResp = await fetch("https://app.asana.com/-/oauth_token", {
+    const resp = await fetch("https://app.asana.com/-/oauth_token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -424,44 +198,50 @@ app.get("/oauth/callback/asana", async (req, res) => {
       }),
     });
 
-    const tokenData = await tokenResp.json();
-    if (!tokenResp.ok || tokenData.error) {
-      return res.status(400).send("Asana token exchange failed: " + JSON.stringify(tokenData));
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      return res.status(400).send("Asana OAuth failed: " + JSON.stringify(data));
     }
-    await saveToken("asana", tokenData);
-    res.send("<h2>✅ Asana Connected!</h2>");
+
+    await saveToken("asana", data);
+    res.send("<h2>✅ Asana connected!</h2>");
   } catch (err) {
-    console.error("Asana OAuth error:", err);
-    res.status(500).send("Server error exchanging Asana token.");
+    res.status(500).send("Asana OAuth error");
   }
 });
 
-/* ---------------- Canto OAuth ---------------- */
-app.get("/connect/canto", (_req, res) => {
+/* ================================================================
+   CANTO OAUTH
+================================================================ */
+app.get("/connect/canto", (req, res) => {
   res.send(`
-    <h1>Connect to Canto</h1>
-    <form action="/connect/canto/start" method="POST">
-      <input type="text" name="domain" placeholder="thedamconsultants" required>
-      <button type="submit">Connect</button>
+    <h1>Connect Canto</h1>
+    <form method="POST" action="/connect/canto/start">
+      <input name="domain" placeholder="thedamconsultants" />
+      <button type="submit">Continue</button>
     </form>
   `);
 });
 
 app.post("/connect/canto/start", (req, res) => {
   const domain = String(req.body.domain || "").trim();
-  if (!domain) return res.status(400).send("Missing Canto domain");
-  const url = `${CANTO_AUTH_URL}?` + new URLSearchParams({
-    response_type: "code",
-    app_id: process.env.CANTO_APP_ID,
-    redirect_uri: process.env.CANTO_REDIRECT_URI,
-    state: domain,
-  });
+  if (!domain) return res.status(400).send("Missing domain");
+
+  const url =
+    `${CANTO_AUTH_URL}?` +
+    new URLSearchParams({
+      response_type: "code",
+      app_id: process.env.CANTO_APP_ID,
+      redirect_uri: process.env.CANTO_REDIRECT_URI,
+      state: domain,
+    });
+
   res.redirect(url);
 });
 
 app.get("/oauth/callback/canto", async (req, res) => {
   const { code, state: domain } = req.query;
-  if (!code || !domain) return res.status(400).send("Missing authorization code or domain");
+  if (!code || !domain) return res.status(400).send("Missing code or state");
 
   try {
     const params = new URLSearchParams({
@@ -480,173 +260,381 @@ app.get("/oauth/callback/canto", async (req, res) => {
 
     const raw = await resp.text();
     let data;
-    try { data = JSON.parse(raw); } catch { return res.status(400).send("Canto token response was not JSON"); }
+    try { data = JSON.parse(raw); } catch {
+      return res.status(400).send("Token response not JSON");
+    }
+
     if (!resp.ok || data.error) {
       return res.status(400).send("Canto OAuth failed: " + JSON.stringify(data));
     }
 
     await persistCantoToken(domain, data);
 
-    // best-effort detection/caching
     try {
       const ver = await detectUploadVersion(domain, data.access_token);
-      console.log(`✅ cached uploadVersion='${ver}' for ${domain}`);
-    } catch { /* ignore */ }
+      console.log(`✅ uploadVersion for ${domain} = ${ver}`);
+    } catch {}
 
-    res.send(`<h2>✅ Canto Connected for <strong>${domain}</strong></h2>`);
+    res.send(`<h2>✅ Canto connected for <strong>${domain}</strong></h2>`);
   } catch (err) {
-    console.error("Canto OAuth error:", err);
-    res.status(500).send("Canto OAuth failed.");
+    res.status(500).send("Canto OAuth error");
   }
 });
 
-/* ---------------- Mapping API ---------------- */
+/* ================================================================
+   MAPPING API
+================================================================ */
 app.get("/mapping/:domain", async (req, res) => {
-  const { domain } = req.params;
-  try {
-    const mapping = await getDomainMapping(domain);
-    res.json({ domain, mapping });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const mapping = await getDomainMapping(req.params.domain);
+  res.json({ domain: req.params.domain, mapping });
 });
 
 app.post("/mapping/:domain", async (req, res) => {
-  const { domain } = req.params;
-  if (!req.body || typeof req.body !== "object") {
-    return res.status(400).json({ error: "Mapping must be an object." });
+  if (typeof req.body !== "object") {
+    return res.status(400).json({ error: "Mapping must be object" });
   }
-  try {
-    const updated = await saveDomainMapping(domain, req.body);
-    res.json({ domain, mapping: updated });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const updated = await saveDomainMapping(req.params.domain, req.body);
+  res.json({ domain: req.params.domain, mapping: updated });
 });
 
 app.delete("/mapping/:domain", async (req, res) => {
-  const { domain } = req.params;
-  try {
-    const cleared = await saveDomainMapping(domain, {});
-    res.json({ domain, cleared: true, mapping: cleared });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  await saveDomainMapping(req.params.domain, {});
+  res.json({ domain: req.params.domain, mapping: {} });
 });
 
-/* ---------------- Status API ---------------- */
-app.get("/status/:domain", async (req, res) => {
-  const { domain } = req.params;
-  try {
-    const cantoToken = await getCantoRecord(domain);
-    const asanaToken = await getToken("asana");
+/* ================================================================
+   CANTO v3 HELPERS
+   Flow: POST /uploads → PUT (S3) → POST /files
+================================================================ */
+async function cantoCreateUploadV3(accessToken, { filename, size, mimeType }) {
+  const r = await fetch(CANTO_UPLOADS_URL_V3, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ filename, size, mimeType }),
+  });
 
-    // expiry calc
-    const now = nowSec();
-    const expiresAt =
-      cantoToken?._expires_at ||
-      (cantoToken?.expires_in ? now + Number(cantoToken.expires_in) : null);
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-    // live probe for upload version (best-effort)
-    let uploadVersion = memory.uploadVersion[domain] || null;
-    if (cantoToken?.access_token && domain && !uploadVersion) {
-      try {
-        uploadVersion = await detectUploadVersion(domain, cantoToken.access_token);
-      } catch { uploadVersion = null; }
+  if (!r.ok) {
+    console.error("[v3 /uploads] HTTP", r.status, data);
+    throw new Error("Canto v3 /uploads failed");
+  }
+
+  if (!data.uploadId || !data.uploadUrl) {
+    console.error("[v3 /uploads] missing uploadId/uploadUrl:", data);
+    throw new Error("Canto v3 /uploads response incomplete");
+  }
+  return data; // { uploadId, uploadUrl, ... }
+}
+
+async function s3PutSignedUrl(uploadUrl, bytes, mimeType) {
+  const r = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": mimeType || "application/octet-stream",
+      "Content-Length": String(bytes.length),
+    },
+    body: bytes,
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    console.error("[S3 PUT] failed:", r.status, t);
+    throw new Error("PUT to signed URL failed");
+  }
+}
+
+async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }) {
+  const r = await fetch(CANTO_FILES_URL_V3, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ uploadId, filename, metadata: metadata || {} }),
+  });
+
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+  if (!r.ok) {
+    console.error("[v3 /files] HTTP", r.status, data);
+    throw new Error("Canto v3 /files failed");
+  }
+  return data;
+}
+
+/* ================================================================
+   CANTO v2 (aka “upload/setting”) HELPERS
+   Flow:
+     1) GET {tenant}/api/v1/upload/setting
+     2) POST multipart form to S3 (uploadUrl + fields + file)
+     3) Find new file (by s3Key or by filename)
+     4) PATCH metadata to /api/v1/files/{id}
+================================================================ */
+async function cantoGetUploadSettingV2(domain, accessToken, { filename }) {
+  const base = tenantApiBase(domain);
+  const url = new URL(`${base}/api/v1/upload/setting`);
+  if (filename) url.searchParams.set("fileName", filename);
+
+  const r = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  });
+
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+  if (!r.ok) {
+    console.error("[v2 upload/setting] HTTP", r.status, data);
+    throw new Error("Canto v2 upload/setting failed");
+  }
+
+  // Most tenants return: { uploadUrl, fields: {key, ...} }
+  // Some older ones: { uploadUrl, params: {...} }
+  const fields = data.fields || data.params;
+  if (!data.uploadUrl || !fields) {
+    console.error("[v2 upload/setting] missing uploadUrl/fields:", data);
+    throw new Error("Canto v2 upload/setting incomplete response");
+  }
+
+  // try to surface s3Key (usually fields.key)
+  const s3Key = fields.key || data.key || null;
+  return { uploadUrl: data.uploadUrl, fields, s3Key };
+}
+
+async function s3MultipartPost(uploadUrl, fields, fileBuffer, fileName, mimeType) {
+  const form = new FormData();
+  Object.entries(fields).forEach(([k, v]) => form.append(k, String(v)));
+  form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
+
+  const r = await fetch(uploadUrl, {
+    method: "POST",
+    headers: form.getHeaders(),
+    body: form,
+  });
+
+  // S3 often returns 204 or 201 (sometimes 200)
+  if (!r.ok && r.status !== 204 && r.status !== 201) {
+    const t = await r.text();
+    console.error("[S3 multipart POST] failed:", r.status, t);
+    throw new Error("S3 multipart POST failed");
+  }
+}
+
+async function cantoFindUploadedFileV2(domain, accessToken, { filename, s3Key }, { tries = 8, delayMs = 800 } = {}) {
+  const base = tenantApiBase(domain);
+
+  // Prefer searching by s3Key if we have it
+  if (s3Key) {
+    for (let i = 0; i < tries; i++) {
+      // Try POST search first (some tenants support body filter)
+      let r = await fetch(`${base}/api/v1/search`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ filter: { s3Key } }),
+      });
+
+      let text = await r.text();
+      let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+      if (r.ok) {
+        const list = data.items || data.results;
+        if (Array.isArray(list) && list.length) return list[0];
+      }
+
+      // Fallback GET query param
+      r = await fetch(`${base}/api/v1/search?s3Key=${encodeURIComponent(s3Key)}`, {
+        headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      });
+
+      text = await r.text();
+      try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+      if (r.ok && Array.isArray(data.items) && data.items.length) {
+        return data.items[0];
+      }
+      await new Promise(res => setTimeout(res, delayMs));
     }
+  }
 
-    const mapping = cantoToken?.mapping || {};
-    res.json({
-      domain,
-      canto: {
-        connected: Boolean(cantoToken?.access_token),
-        expires_at: expiresAt || null,
-        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
-        has_refresh: Boolean(cantoToken?.refresh_token),
-        uploadVersion,
-      },
-      mapping: { count: Object.keys(mapping).length },
-      asana: { connected: Boolean(asanaToken?.access_token) },
+  // Last resort: poll recent and match by filename
+  for (let i = 0; i < tries; i++) {
+    const r = await fetch(`${base}/api/v1/files/recent`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
     });
-  } catch (err) {
-    console.error("Status error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
+    const text = await r.text();
+    let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-// dedicated Asana status for dashboard’s correctness
-app.get("/status/asana", async (_req, res) => {
-  try {
-    const asanaToken = await getToken("asana");
-    res.json({ domain: "asana", asana: { connected: Boolean(asanaToken?.access_token) } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (r.ok && Array.isArray(data.items)) {
+      const found = data.items.find(
+        x => x?.originalName === filename || x?.name === filename
+      );
+      if (found) return found;
+    }
+    await new Promise(res => setTimeout(res, delayMs));
   }
-});
 
-/* ---------------- Unified Upload Route ----------------
-Body: { domain, attachmentUrl, metadata? }
-------------------------------------------------------- */
+  throw new Error("Uploaded file not found after polling");
+}
+
+async function cantoPatchMetadataV2(domain, accessToken, fileId, metadataObj) {
+  const base = tenantApiBase(domain);
+  const url = `${base}/api/v1/files/${encodeURIComponent(fileId)}`;
+
+  const r = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ metadata: metadataObj || {} }),
+  });
+
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+  if (!r.ok) {
+    console.error("[v2 PATCH metadata] HTTP", r.status, data);
+    throw new Error("Canto v2 metadata patch failed");
+  }
+  return data;
+}
+
+/* ================================================================
+   UNIFIED UPLOAD DISPATCHER
+================================================================ */
+async function uploadToCanto(domain, accessToken, { buffer, filename, mimeType, metadata }) {
+  // figure out which flow this tenant uses
+  let ver = (await getToken(domain))?.uploadVersion;
+  if (!ver) ver = await detectUploadVersion(domain, accessToken);
+
+  if (ver === "v3") {
+    // v3: oauth host
+    const created = await cantoCreateUploadV3(accessToken, {
+      filename, size: buffer.length, mimeType
+    });
+    await s3PutSignedUrl(created.uploadUrl, buffer, mimeType);
+    const file = await cantoFinalizeFileV3(accessToken, {
+      uploadId: created.uploadId,
+      filename,
+      metadata
+    });
+    // v3 response usually includes file info with id/links
+    return { version: "v3", file };
+  }
+
+  // v2: tenant upload/setting
+  const setting = await cantoGetUploadSettingV2(domain, accessToken, { filename });
+  await s3MultipartPost(setting.uploadUrl, setting.fields, buffer, filename, mimeType);
+
+  // try to find it (by s3Key or filename)
+  const uploaded = await cantoFindUploadedFileV2(
+    domain,
+    accessToken,
+    { filename, s3Key: setting.s3Key },
+    { tries: 10, delayMs: 800 }
+  );
+
+  // then patch metadata
+  const patched = await cantoPatchMetadataV2(domain, accessToken, uploaded.id, metadata || {});
+  return { version: "v2", file: patched, found: uploaded };
+}
+
+/* ================================================================
+   ROUTE: POST /upload
+   Body: { domain, attachmentUrl, metadata? }
+================================================================ */
 app.post("/upload", async (req, res) => {
-  const { attachmentUrl, domain, metadata } = req.body;
+  const { domain, attachmentUrl, metadata } = req.body || {};
   if (!domain) return res.status(400).json({ error: "Missing domain" });
   if (!attachmentUrl) return res.status(400).json({ error: "Missing attachmentUrl" });
 
   try {
-    // refresh token
+    // refresh canto token for this domain
     const token = await refreshCantoTokenIfNeeded(domain);
     if (!token?.access_token) return res.status(400).json({ error: "Canto token not found" });
 
-    // download
+    // fetch file bytes
     const dl = await fetch(attachmentUrl);
     if (!dl.ok) {
       return res.status(400).json({
         error: "Failed to download attachment",
         status: dl.status,
-        text: await dl.text(),
+        text: await dl.text()
       });
     }
     const mimeType = dl.headers.get("content-type") || "application/octet-stream";
-    const bytes = Buffer.from(await dl.arrayBuffer());
+    const buffer = Buffer.from(await dl.arrayBuffer());
     const filename = filenameFromUrl(attachmentUrl);
 
-    const metaObj =
-      typeof metadata === "string"
-        ? (JSON.parse(metadata || "{}"))
-        : (metadata || {});
+    // mapping
+    let meta = {};
+    if (metadata) {
+      try {
+        meta = typeof metadata === "string" ? JSON.parse(metadata) : (metadata || {});
+      } catch { meta = {}; }
+    }
+    const mapping = await getDomainMapping(domain);
+    const mapped = applyFieldMapping(mapping, meta);
 
-    const out = await uploadToCanto({
-      domain,
-      accessToken: token.access_token,
-      bytes,
-      filename,
-      mimeType,
-      metadata: metaObj,
+    // do upload
+    const out = await uploadToCanto(domain, token.access_token, {
+      buffer, filename, mimeType, metadata: mapped
     });
 
-    res.json({ ok: true, domain, filename, version: out.version, cantoFileId: out.fileId, cantoFile: out.file });
+    // try to surface a view URL if present
+    const assetUrl =
+      out?.file?.url ||
+      out?.file?.publicUrl ||
+      out?.file?.links?.view ||
+      out?.found?.links?.view ||
+      null;
+
+    res.json({
+      ok: true,
+      version: out.version,
+      domain,
+      filename,
+      assetUrl,
+      cantoFile: out.file,
+      found: out.found || null
+    });
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-/* ---------------- Test Upload (multipart) ---------------
-Form-data: domain, file
---------------------------------------------------------- */
+/* ================================================================
+   ROUTE: POST /test/upload-canto
+   multipart: fields { domain }, file part { file }
+================================================================ */
 app.post("/test/upload-canto", async (req, res) => {
   const busboy = Busboy({ headers: req.headers });
   let domain, fileBuffer, fileName, mimeType;
 
   busboy.on("field", (name, val) => {
-    if (name === "domain") domain = String(val).trim();
+    if (name === "domain") domain = String(val || "").trim();
   });
 
-  busboy.on("file", (_name, file, info) => {
+  busboy.on("file", (name, file, info) => {
     const chunks = [];
     fileName = info.filename;
     mimeType = info.mimeType || "application/octet-stream";
-    file.on("data", (d) => chunks.push(d));
+    file.on("data", d => chunks.push(d));
     file.on("end", () => { fileBuffer = Buffer.concat(chunks); });
   });
 
@@ -658,16 +646,14 @@ app.post("/test/upload-canto", async (req, res) => {
       const token = await refreshCantoTokenIfNeeded(domain);
       if (!token?.access_token) return res.status(400).send("Canto token not found");
 
-      const out = await uploadToCanto({
-        domain,
-        accessToken: token.access_token,
-        bytes: fileBuffer,
+      const out = await uploadToCanto(domain, token.access_token, {
+        buffer: fileBuffer,
         filename: fileName,
         mimeType,
-        metadata: {}, // test route skips metadata (UI route handles)
+        metadata: {}, // test route keeps it simple
       });
 
-      res.json({ success: true, version: out.version, fileId: out.fileId, data: out.file });
+      res.json({ success: true, version: out.version, result: out });
     } catch (err) {
       console.error("Test upload error:", err);
       res.status(500).send("Error uploading file.");
@@ -677,153 +663,100 @@ app.post("/test/upload-canto", async (req, res) => {
   req.pipe(busboy);
 });
 
-/* ---------------- Asana Webhook ---------------- */
-app.post("/webhook/asana", (req, res) => {
-  const challenge = req.headers["x-hook-secret"];
-  if (challenge) {
-    res.setHeader("X-Hook-Secret", challenge);
-    return res.status(200).send();
-  }
-  console.log("📩 Asana webhook:", JSON.stringify(req.body, null, 2));
-  res.status(200).send("OK");
-});
-
 /* ================================================================
-   MAPPING UI (simple)
+   STATUS API (for Dashboard)
 ================================================================ */
-app.get("/mapping-ui/:domain", async (req, res) => {
+app.get("/status/:domain", async (req, res) => {
   const { domain } = req.params;
-  res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>Canto Field Mapping – ${domain}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100 text-gray-900">
-  <div class="max-w-3xl mx-auto mt-10 p-8 bg-white shadow-lg rounded-lg">
-    <h1 class="text-3xl font-bold mb-6">
-      Canto Field Mapping for <span class="text-indigo-600">${domain}</span>
-    </h1>
+  try {
+    const cantoToken = await getToken(domain);
+    const asanaToken = await getToken("asana");
 
-    <table class="w-full mb-6 border">
-      <thead class="bg-gray-200">
-        <tr>
-          <th class="p-3 text-left">Asana Field</th>
-          <th class="p-3 text-left">Canto Field</th>
-          <th class="p-3"></th>
-        </tr>
-      </thead>
-      <tbody id="mappingRows"></tbody>
-    </table>
+    const mapping = cantoToken?.mapping || {};
 
-    <div class="flex gap-4 mb-6">
-      <input id="newAsana" class="border p-2 flex-1 rounded" placeholder="Asana Field Name">
-      <input id="newCanto" class="border p-2 flex-1 rounded" placeholder="Canto Field Key">
-      <button onclick="addRow()" class="bg-green-600 px-4 py-2 text-white rounded">Add</button>
-    </div>
+    // Expiry from DB or computed
+    const expiresAt =
+      cantoToken?._expires_at ||
+      (cantoToken?.expires_in
+        ? Math.floor(Date.now() / 1000) + Number(cantoToken.expires_in)
+        : null);
 
-    <div class="flex gap-4">
-      <button onclick="saveMapping()" class="bg-indigo-600 text-white px-6 py-2 rounded">Save Mapping</button>
-      <button onclick="resetMapping()" class="bg-red-600 text-white px-6 py-2 rounded">Reset Mapping</button>
-      <a href="/dashboard/${domain}" class="ml-auto bg-slate-700 text-white px-6 py-2 rounded">Open Dashboard</a>
-    </div>
-  </div>
+    // Try to determine upload version (cache or live ping)
+    let uploadVersion = cantoToken?.uploadVersion || null;
 
-<script>
-  const domain = "${domain}";
-  let mapping = {};
+    if (!uploadVersion && cantoToken?.access_token) {
+      // Try legacy endpoint to see if v2 is enabled
+      const url = `https://${domain}.canto.com/api/v1/upload/setting`;
 
-  async function loadMapping() {
-    const res = await fetch("/mapping/" + domain);
-    const data = await res.json();
-    mapping = data.mapping || {};
-    renderRows();
-  }
+      try {
+        const resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${cantoToken.access_token}` },
+        });
+        if (resp.ok) uploadVersion = "v2";
+        else uploadVersion = "v3";
+      } catch {
+        uploadVersion = "v3";
+      }
 
-  function renderRows() {
-    const tbody = document.getElementById("mappingRows");
-    tbody.innerHTML = "";
-    const entries = Object.entries(mapping);
-    if (!entries.length) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="3" class="p-4 text-center text-gray-500">No mappings yet</td>';
-      tbody.appendChild(tr);
-      return;
+      // Save to DB for future calls
+      await persistCantoRecord(domain, { uploadVersion });
     }
-    for (const [asana, canto] of entries) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = \`
-        <td class="p-3 border">
-          <input value="\${asana}" class="border p-2 w-full rounded" data-original="\${asana}" onchange="editAsana(this)">
-        </td>
-        <td class="p-3 border">
-          <input value="\${canto}" class="border p-2 w-full rounded" onchange="editCanto('\${asana}', this)">
-        </td>
-        <td class="p-3 border text-center">
-          <button onclick="deleteRow('\${asana}')" class="px-3 py-1 bg-red-600 text-white rounded">Delete</button>
-        </td>
-      \`;
-      tbody.appendChild(tr);
-    }
-  }
 
-  function addRow() {
-    const asana = document.getElementById("newAsana").value.trim();
-    const canto = document.getElementById("newCanto").value.trim();
-    if (!asana || !canto) return alert("Both fields required");
-    mapping[asana] = canto;
-    document.getElementById("newAsana").value = "";
-    document.getElementById("newCanto").value = "";
-    renderRows();
-  }
-
-  function editAsana(input) {
-    const original = input.getAttribute("data-original");
-    const updated = input.value.trim();
-    if (!updated) { input.value = original; return; }
-    mapping[updated] = mapping[original];
-    delete mapping[original];
-    renderRows();
-  }
-
-  function editCanto(asana, input) {
-    mapping[asana] = input.value.trim();
-  }
-
-  function deleteRow(asana) {
-    delete mapping[asana];
-    renderRows();
-  }
-
-  async function saveMapping() {
-    const res = await fetch("/mapping/" + domain, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mapping)
+    res.json({
+      domain,
+      canto: {
+        connected: Boolean(cantoToken?.access_token),
+        expires_at: expiresAt,
+        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
+        has_refresh: Boolean(cantoToken?.refresh_token),
+        uploadVersion,
+      },
+      mapping: {
+        count: Object.keys(mapping).length,
+      },
+      asana: {
+        connected: Boolean(asanaToken?.access_token),
+      },
     });
-    if (res.ok) alert("✅ Mapping saved!");
-    else alert("❌ Failed to save mapping");
+  } catch (err) {
+    console.error("Status error:", err);
+    res.status(500).json({ error: err.message });
   }
-
-  async function resetMapping() {
-    if (!confirm("Are you sure? This will delete all mappings.")) return;
-    const res = await fetch("/mapping/" + domain, { method: "DELETE" });
-    if (res.ok) { mapping = {}; renderRows(); alert("✅ Mapping reset"); }
-    else alert("❌ Failed to reset mapping");
-  }
-
-  loadMapping();
-</script>
-</body>
-</html>
-  `);
 });
 
 /* ================================================================
-   DASHBOARD
+   STATUS API — ASANA (used by Dashboard to avoid domain=asana confusion)
+================================================================ */
+app.get("/status/asana", async (req, res) => {
+  try {
+    const t = await getToken("asana");
+    if (!t) {
+      return res.json({
+        asana: { connected: false },
+      });
+    }
+
+    const expiresAt =
+      t.expires_at ||
+      (t.expires_in
+        ? Math.floor(Date.now() / 1000) + Number(t.expires_in)
+        : null);
+
+    res.json({
+      asana: {
+        connected: Boolean(t.access_token),
+        expires_at: expiresAt,
+        expires_at_iso: expiresAt ? new Date(expiresAt * 1000).toISOString() : null,
+      },
+    });
+  } catch (err) {
+    console.error("Asana status error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================================================================
+   FULL DASHBOARD UI (per-domain)
 ================================================================ */
 app.get("/dashboard/:domain", async (req, res) => {
   const { domain } = req.params;
@@ -856,25 +789,29 @@ app.get("/dashboard/:domain", async (req, res) => {
         <p id="cantoConnected" class="mb-1">–</p>
         <p id="cantoExpiry" class="mb-1">–</p>
         <p id="cantoRefresh" class="mb-1">–</p>
+        <p id="cantoUploadVer" class="mb-1">–</p>
       </div>
 
       <div class="bg-white rounded-lg shadow p-5">
         <h2 class="text-lg font-semibold mb-2">Asana Status</h2>
         <p id="asanaConnected" class="mb-1">–</p>
-        <p class="text-sm text-gray-500">Note: This is app-wide, not per-domain</p>
+        <p id="asanaExpiry" class="mb-1">–</p>
       </div>
 
       <div class="bg-white rounded-lg shadow p-5">
         <h2 class="text-lg font-semibold mb-2">Mapping Status</h2>
         <p id="mappingCount" class="mb-1">–</p>
         <div class="flex gap-3">
-          <a href="/mapping-ui/${domain}" class="mt-2 px-3 py-2 bg-slate-700 text-white rounded hover:bg-slate-800">Open Mapping UI</a>
-          <button id="resetMappingBtn" class="mt-2 px-3 py-2 bg-red-600 text-white rounded hover:bg-red-700">Reset Mapping</button>
+          <a href="/mapping-ui/${domain}" class="mt-2 px-3 py-2 bg-slate-700 text-white rounded hover:bg-slate-800">
+            Open Mapping UI
+          </a>
+          <button id="resetMappingBtn" class="mt-2 px-3 py-2 bg-red-600 text-white rounded hover:bg-red-700">
+            Reset Mapping
+          </button>
         </div>
       </div>
     </section>
 
-    <!-- Mapping Manager -->
     <section class="bg-white rounded-lg shadow p-6 mb-10">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xl font-semibold">Field Mapping (Asana → Canto)</h2>
@@ -899,14 +836,15 @@ app.get("/dashboard/:domain", async (req, res) => {
       </div>
     </section>
 
-    <!-- Upload Tester -->
     <section class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-10">
       <div class="bg-white rounded-lg shadow p-6">
         <h2 class="text-xl font-semibold mb-4">Upload by URL</h2>
         <div class="flex flex-col gap-3">
           <input id="uploadUrl" class="border p-2 rounded" placeholder="https://example.com/file.jpg" />
-          <textarea id="uploadMeta" class="border p-2 rounded" rows="4" placeholder='Optional metadata JSON, e.g. {"Market":"US"}'></textarea>
-          <button id="uploadUrlBtn" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">Upload URL → Canto</button>
+          <textarea id="uploadMeta" class="border p-2 rounded" rows="4" placeholder='Optional metadata JSON'></textarea>
+          <button id="uploadUrlBtn" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">
+            Upload URL → Canto
+          </button>
         </div>
         <pre id="uploadUrlOut" class="mt-4 bg-gray-900 text-gray-100 p-3 rounded text-sm overflow-auto"></pre>
       </div>
@@ -915,14 +853,16 @@ app.get("/dashboard/:domain", async (req, res) => {
         <h2 class="text-xl font-semibold mb-4">Upload a File</h2>
         <div class="flex flex-col gap-3">
           <input id="uploadFileInput" type="file" class="border p-2 rounded bg-gray-50" />
-          <button id="uploadFileBtn" class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700">Upload File → Canto</button>
+          <button id="uploadFileBtn" class="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700">
+            Upload File → Canto
+          </button>
         </div>
         <pre id="uploadFileOut" class="mt-4 bg-gray-900 text-gray-100 p-3 rounded text-sm overflow-auto"></pre>
       </div>
     </section>
 
     <footer class="text-sm text-gray-500">
-      <p>Asana ↔ Canto Dashboard for <strong>${domain}</strong>. Powered by your Node.js integration.</p>
+      <p>Asana ↔ Canto Integration for <strong>${domain}</strong>.</p>
     </footer>
   </div>
 
@@ -931,144 +871,150 @@ app.get("/dashboard/:domain", async (req, res) => {
   let mapping = {};
 
   async function loadStatus() {
-    const rDomain = await fetch("/status/" + domain);
-    const sDomain = await rDomain.json();
+    const r1 = await fetch("/status/" + domain);
+    const s1 = await r1.json();
 
-    const rAsana = await fetch("/status/asana");
-    const sAsana = await rAsana.json();
+    const r2 = await fetch("/status/asana");
+    const s2 = await r2.json();
 
     document.getElementById("cantoConnected").textContent =
-      "Connected: " + (sDomain.canto?.connected ? "Yes ✅" : "No ❌");
-    document.getElementById("cantoRefresh").textContent =
-      "Has refresh token: " + (sDomain.canto?.has_refresh ? "Yes" : "No");
+      "Connected: " + (s1.canto && s1.canto.connected ? "Yes ✅" : "No ❌");
 
-    let expText = "Expires: –";
-    if (sDomain.canto?.expires_at_iso) {
-      const dt = new Date(sDomain.canto.expires_at_iso);
-      expText = "Expires: " + dt.toLocaleString();
-    }
-    document.getElementById("cantoExpiry").textContent = expText;
+    document.getElementById("cantoRefresh").textContent =
+      "Refresh token: " + (s1.canto && s1.canto.has_refresh ? "Yes" : "No");
+
+    document.getElementById("cantoUploadVer").textContent =
+      "Upload API: " + ((s1.canto && s1.canto.uploadVersion) || "unknown");
+
+    document.getElementById("cantoExpiry").textContent =
+      (s1.canto && s1.canto.expires_at_iso)
+        ? "Expires: " + new Date(s1.canto.expires_at_iso).toLocaleString()
+        : "Expires: –";
 
     document.getElementById("asanaConnected").textContent =
-      "Connected: " + (sAsana.asana?.connected ? "Yes ✅" : "No ❌");
+      "Connected: " + (s2.asana && s2.asana.connected ? "Yes ✅" : "No ❌");
+
+    document.getElementById("asanaExpiry").textContent =
+      (s2.asana && s2.asana.expires_at_iso)
+        ? "Expires: " + new Date(s2.asana.expires_at_iso).toLocaleString()
+        : "Expires: –";
 
     document.getElementById("mappingCount").textContent =
-      "Current mappings: " + (sDomain.mapping?.count ?? 0);
+      "Mappings: " + ((s1.mapping && s1.mapping.count) || 0);
   }
 
   async function loadMapping() {
-    const res = await fetch("/mapping/" + domain);
-    const data = await res.json();
-    mapping = data.mapping || {};
+    const r = await fetch("/mapping/" + domain);
+    const d = await r.json();
+    mapping = d.mapping || {};
     renderRows();
   }
 
   function renderRows() {
     const tbody = document.getElementById("mappingRows");
     tbody.innerHTML = "";
+
     const entries = Object.entries(mapping);
     if (!entries.length) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = '<td colspan="3" class="p-4 text-center text-gray-500">No mappings yet</td>';
-      tbody.appendChild(tr);
+      tbody.innerHTML = '<tr><td colspan="3" class="text-center p-3 text-gray-500">No mappings</td></tr>';
       return;
     }
+
     for (const [asana, canto] of entries) {
       const tr = document.createElement("tr");
-      tr.innerHTML = \`
-        <td class="p-3 border"><input class="w-full border p-2 rounded" value="\${asana}" data-original="\${asana}" onchange="editAsana(this)" /></td>
-        <td class="p-3 border"><input class="w-full border p-2 rounded" value="\${canto}" onchange="editCanto('\${asana}', this)" /></td>
-        <td class="p-3 border text-center">
-          <button onclick="deleteRow('\${asana}')" class="px-2 py-1 bg-red-600 text-white rounded">Delete</button>
-        </td>
-      \`;
+      tr.innerHTML =
+        '<td class="p-3 border">' + asana + '</td>' +
+        '<td class="p-3 border">' + canto + '</td>' +
+        '<td class="p-3 border text-center">' +
+          '<button type="button" class="px-2 py-1 bg-red-600 text-white rounded" onclick="removeMapping(\\'' + asana.replace(/'/g, "\\'") + '\\')">Delete</button>' +
+        '</td>';
       tbody.appendChild(tr);
     }
   }
 
-  window.editAsana = (input) => {
-    const original = input.getAttribute("data-original");
-    const val = input.value.trim();
-    if (!val) { input.value = original; return; }
-    mapping[val] = mapping[original];
-    delete mapping[original];
+  window.removeMapping = function(asanaField) {
+    delete mapping[asanaField];
     renderRows();
   };
 
-  window.editCanto = (asana, input) => {
-    mapping[asana] = input.value.trim();
-  };
-
-  window.deleteRow = (asana) => {
-    delete mapping[asana];
-    renderRows();
-  };
-
-  document.getElementById("addRowBtn").addEventListener("click", () => {
+  document.getElementById("addRowBtn").onclick = function() {
     const a = document.getElementById("newAsana").value.trim();
     const c = document.getElementById("newCanto").value.trim();
-    if (!a || !c) return alert("Both fields required");
+    if (!a || !c) { alert("Both fields required"); return; }
     mapping[a] = c;
     document.getElementById("newAsana").value = "";
     document.getElementById("newCanto").value = "";
     renderRows();
-  });
+  };
 
-  document.getElementById("saveMappingBtn").addEventListener("click", async () => {
-    const res = await fetch("/mapping/" + domain, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(mapping),
-    });
-    if (res.ok) { alert("✅ Mapping saved"); loadStatus(); }
-    else { alert("❌ Failed to save mapping"); }
-  });
+  document.getElementById("saveMappingBtn").onclick = async function() {
+    try {
+      const r = await fetch("/mapping/" + domain, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(mapping),
+      });
+      if (!r.ok) throw new Error("Save failed: " + r.status);
+      alert("✅ Mapping saved");
+    } catch (e) {
+      alert("❌ " + (e && e.message ? e.message : "Failed to save mapping"));
+    }
+  };
 
-  document.getElementById("resetMappingBtn").addEventListener("click", async () => {
-    if (!confirm("Reset all mappings for this domain?")) return;
-    const res = await fetch("/mapping/" + domain, { method: "DELETE" });
-    if (res.ok) {
+  document.getElementById("resetMappingBtn").onclick = async function() {
+    if (!confirm("Reset all mappings?")) return;
+    try {
+      const r = await fetch("/mapping/" + domain, { method: "DELETE" });
+      if (!r.ok) throw new Error("Reset failed: " + r.status);
       mapping = {};
       renderRows();
-      loadStatus();
       alert("✅ Mapping reset");
-    } else {
-      alert("❌ Failed to reset mapping");
+    } catch (e) {
+      alert("❌ " + (e && e.message ? e.message : "Failed to reset mapping"));
     }
-  });
+  };
 
-  // Upload by URL
-  document.getElementById("uploadUrlBtn").addEventListener("click", async () => {
+  document.getElementById("uploadUrlBtn").onclick = async function() {
     const url = document.getElementById("uploadUrl").value.trim();
-    const metaText = document.getElementById("uploadMeta").value.trim();
-    if (!url) return alert("Provide a URL");
-    let metaObj = {};
-    if (metaText) { try { metaObj = JSON.parse(metaText); } catch { return alert("Metadata must be valid JSON"); } }
+    const meta = document.getElementById("uploadMeta").value.trim();
 
-    const r = await fetch("/upload", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domain, attachmentUrl: url, metadata: metaObj }),
-    });
-    const t = await r.text();
-    document.getElementById("uploadUrlOut").textContent = t;
-    loadStatus();
-  });
+    if (!url) { alert("Provide a URL"); return; }
 
-  // Upload by File
-  document.getElementById("uploadFileBtn").addEventListener("click", async () => {
+    let metadata = {};
+    if (meta) {
+      try { metadata = JSON.parse(meta); }
+      catch { alert("Metadata must be valid JSON"); return; }
+    }
+
+    try {
+      const r = await fetch("/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ domain: domain, attachmentUrl: url, metadata: metadata }),
+      });
+      document.getElementById("uploadUrlOut").textContent = await r.text();
+      loadStatus();
+    } catch {
+      document.getElementById("uploadUrlOut").textContent = "Request failed.";
+    }
+  };
+
+  document.getElementById("uploadFileBtn").onclick = async function() {
     const input = document.getElementById("uploadFileInput");
-    if (!input.files || !input.files.length) return alert("Choose a file first");
+    if (!input.files.length) { alert("Select a file"); return; }
 
     const fd = new FormData();
     fd.append("domain", domain);
     fd.append("file", input.files[0]);
 
-    const r = await fetch("/test/upload-canto", { method: "POST", body: fd });
-    const t = await r.text();
-    document.getElementById("uploadFileOut").textContent = t;
-    loadStatus();
-  });
+    try {
+      const r = await fetch("/test/upload-canto", { method: "POST", body: fd });
+      document.getElementById("uploadFileOut").textContent = await r.text();
+      loadStatus();
+    } catch {
+      document.getElementById("uploadFileOut").textContent = "Upload failed.";
+    }
+  };
 
   loadStatus();
   loadMapping();
@@ -1077,10 +1023,28 @@ app.get("/dashboard/:domain", async (req, res) => {
 </html>`);
 });
 
+
+
+/* ================================================================
+   ASANA WEBHOOK HANDLER
+================================================================ */
+app.post("/webhook/asana", (req, res) => {
+  const challenge = req.headers["x-hook-secret"];
+  if (challenge) {
+    res.setHeader("X-Hook-Secret", challenge);
+    return res.status(200).send();
+  }
+  console.log("📩 Asana webhook:", JSON.stringify(req.body, null, 2));
+  res.status(200).send("OK");
+});
+
 /* ================================================================
    START SERVER
 ================================================================ */
 const port = process.env.PORT || 3000;
+
 initDB().then(() => {
-  app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+  app.listen(port, () => {
+    console.log(`🚀 Server running on port ${port}`);
+  });
 });
