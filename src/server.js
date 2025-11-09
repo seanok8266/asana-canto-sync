@@ -541,34 +541,75 @@ async function cantoFindUploadedFileV2(
 
 /**
  * Step 3 – Patch metadata using batch edit
+ * Auto-detects whether the tenant supports metadata write API.
+ * If the tenant returns HTML (login page), metadata is skipped gracefully.
  */
 async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {}) {
+  // If no metadata provided → skip
   if (!metadata || Object.keys(metadata).length === 0) {
-    return { ok: true, skipped: true };
+    return { ok: true, skipped: true, reason: "empty metadata" };
   }
 
   const base = tenantApiBase(domain);
+  const url = `${base}/api/v1/files/update`;
 
-  const body = {
-    files: [assetId],
-    metadata
-  };
-
-  const r = await fetch(`${base}/api/v1/files/update`, {
+  const r = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      Accept: "application/json"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      files: [assetId],
+      metadata
+    })
   });
 
   const text = await r.text();
-  if (!r.ok) {
-    return { ok: false, error: text };
+
+  // ✅ Detect HTML response → means tenant does NOT have metadata API enabled
+  if (text.trim().startsWith("<")) {
+    console.warn(
+      `⚠️  Metadata disabled for ${domain}: endpoint returned HTML, skipping metadata patch`
+    );
+    return {
+      ok: true,
+      skipped: true,
+      reason: "metadata API disabled on tenant"
+    };
   }
 
-  return { ok: true, raw: text };
+  // Try parsing JSON if possible
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // Non-JSON but not HTML (rare) → still treat as soft skip
+    return {
+      ok: true,
+      skipped: true,
+      reason: "non-JSON response, metadata skipped",
+      raw: text
+    };
+  }
+
+  // If HTTP status is not OK → return error, but no crash
+  if (!r.ok) {
+    console.warn(
+      `⚠️ Metadata patch failed for ${domain}:`,
+      data
+    );
+    return {
+      ok: false,
+      skipped: true,
+      reason: "metadata API rejected request",
+      error: data
+    };
+  }
+
+  // ✅ Success
+  return { ok: true, patched: true, response: data };
 }
 
 
