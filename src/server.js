@@ -815,6 +815,15 @@ app.post("/test/upload-canto", async (req, res) => {
         return res.status(400).json({ error: "Canto token not found" });
       }
 
+      console.log("=== DEBUG TOKEN USED ===");
+console.log("token.domain:", token.domain);
+console.log("access_token (first 20 chars):", token.access_token?.substring(0, 20));
+console.log("refresh_token (first 20 chars):", token.refresh_token?.substring(0, 20));
+console.log("expires_in:", token.expires_in);
+console.log("expires_at:", token._expires_at || token.expires_at);
+console.log("Authorization header:", `Bearer ${token.access_token}`);
+console.log("=========================");
+
       const out = await uploadToCanto(domain, token.access_token, {
         buffer: fileBuffer,
         filename: fileName,
