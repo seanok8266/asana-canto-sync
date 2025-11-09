@@ -456,30 +456,37 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
 async function cantoRequestUploadSlot(domain, accessToken, filename) {
   const base = tenantApiBase(domain);
 
-  const url = `${base}/api/v1/upload/setting?fileName=${encodeURIComponent(filename)}`;
-
-  const r = await fetch(url, {
-    method: "GET",
+  const r = await fetch(`${base}/api/v1/upload/setting`, {
+    method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json"
-    }
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      uploadType: "file",
+      fileName: filename
+    }),
   });
 
   const text = await r.text();
-
   if (text.trim().startsWith("<")) {
-    throw new Error("Canto /upload/setting returned HTML (token or permissions issue)");
+    throw new Error("Canto /upload/setting returned HTML instead of JSON");
   }
 
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error("Canto /upload/setting returned non-JSON");
+  try { data = JSON.parse(text); }
+  catch { throw new Error("Canto /upload/setting returned non-JSON"); }
+
+  // Normalize shapes across tenants
+  const uploadUrl = data.uploadUrl || data.url;
+  const fields    = data.fields || data.form?.fields || data.form;
+
+  if (!uploadUrl || !fields || typeof fields !== "object") {
+    throw new Error("Canto /upload/setting missing uploadUrl/fields");
   }
 
-  return data;
+  return { uploadUrl, fields };
 }
 
 
@@ -626,19 +633,33 @@ async function cantoUploadFileV2(domain, accessToken, file, metadata = {}) {
     throw new Error("Invalid Canto upload-setting response");
   }
 
-  // 2) upload to S3 (putObject)
-  const uploadR = await fetch(setting.uploadUrl, {
-    method: "PUT",
-    headers: {
-      "Content-Type": file.mimetype || "application/octet-stream",
-    },
-    body: file.buffer
+  // 2) upload to S3 (multipart POST with policy fields)
+{
+  const fd = new FormData();
+  // Required policy fields from Canto
+  for (const [k, v] of Object.entries(setting.fields)) {
+    fd.append(k, v);
+  }
+  // The actual file must be the last part, field name literally "file"
+  fd.append("file", file.buffer, {
+    filename,
+    contentType: file.mimetype || "application/octet-stream",
+    knownLength: file.buffer.length
   });
 
-  if (!uploadR.ok) {
-    const t = await uploadR.text();
-    throw new Error(`S3 upload failed: ${t}`);
+  const s3Res = await fetch(setting.uploadUrl, {
+    method: "POST",
+    body: fd,
+    headers: fd.getHeaders ? fd.getHeaders() : undefined
+  });
+
+  // S3 may return 204 No Content, 201 (XML), or 200
+  if (![200, 201, 204].includes(s3Res.status)) {
+    const errText = await s3Res.text().catch(() => "");
+    throw new Error(`S3 POST failed (${s3Res.status}) ${errText}`);
   }
+}
+
 
   // 3) find ingested asset
   const found = await cantoFindUploadedFileV2(
