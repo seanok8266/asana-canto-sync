@@ -428,7 +428,7 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
     console.error("[v3 /files] HTTP", r.status, data);
     throw new Error("Canto v3 /files failed");
   }
-  return data;
+   return scrubHtml(data);
 }
 
 /* ============================================================
