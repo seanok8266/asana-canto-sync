@@ -628,7 +628,17 @@ async function uploadToCanto(domain, accessToken, { buffer, filename, mimeType, 
 
   // then patch metadata
   const patched = await cantoPatchMetadataV2(domain, accessToken, uploaded.id, metadata || {});
-  return { version: "v2", file: patched, found: uploaded };
+  return {
+  ok: true,
+  version: "v2",
+  domain,
+  filename,
+  assetUrl: uploaded.url?.detail || null,
+  assetPreview: uploaded.url?.preview || null,
+  cantoFile: patched,
+  found: uploaded
+};
+
 }
 
 /* ================================================================
