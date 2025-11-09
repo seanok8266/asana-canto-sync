@@ -622,6 +622,51 @@ async function cantoUploadFileV2(domain, accessToken, file, metadata = {}) {
   };
 }
 
+/* ================================================================
+   Unified Upload Dispatcher — uploadToCanto()
+   Chooses v2 or v3 depending on domain
+================================================================ */
+async function uploadToCanto(domain, accessToken, { buffer, filename, mimeType, metadata }) {
+  // Detect version first
+  const version = await detectUploadVersion(domain, accessToken);
+
+  if (version === "v2") {
+    // v2 upload pipeline
+    return await cantoUploadFileV2(
+      domain,
+      accessToken,
+      {
+        buffer,
+        name: filename,
+        originalname: filename,
+        mimetype: mimeType
+      },
+      metadata
+    );
+  }
+
+  // v3 pipeline
+  const created = await cantoCreateUploadV3(accessToken, {
+    filename,
+    size: buffer.length,
+    mimeType
+  });
+
+  await s3PutSignedUrl(created.uploadUrl, buffer, mimeType);
+
+  const file = await cantoFinalizeFileV3(accessToken, {
+    uploadId: created.uploadId,
+    filename,
+    metadata
+  });
+
+  return {
+    ok: true,
+    version: "v3",
+    file
+  };
+}
+
 
 /* ================================================================
    ROUTE: POST /upload
