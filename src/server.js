@@ -54,6 +54,33 @@ function filenameFromUrl(urlStr) {
 }
 
 /* ================================================================
+   CLEANUP: Strip HTML responses from objects before JSON output
+================================================================ */
+function scrubHtml(input) {
+  if (input == null) return input;
+
+  if (typeof input === "string") {
+    return input.trim().startsWith("<")
+      ? "[HTML response omitted]"
+      : input;
+  }
+
+  if (Array.isArray(input)) {
+    return input.map(scrubHtml);
+  }
+
+  if (typeof input === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(input)) {
+      out[key] = scrubHtml(value);
+    }
+    return out;
+  }
+
+  return input;
+}
+
+/* ================================================================
    TOKEN HELPERS
 ================================================================ */
 async function persistCantoRecord(domain, patch) {
@@ -753,15 +780,19 @@ app.post("/upload", async (req, res) => {
       out?.found?.links?.view ||
       null;
 
-    res.json({
-      ok: true,
-      version: out.version,
-      domain,
-      filename,
-      assetUrl,
-      cantoFile: out.file,
-      found: out.found || null
-    });
+   res.json(
+  scrubHtml({
+    ok: true,
+    version: out.version,
+    domain,
+    filename,
+    assetUrl,
+    cantoFile: out.file,
+    found: out.found || null,
+    metadataStatus: out.metadataStatus
+  })
+);
+
   } catch (err) {
     console.error("UPLOAD ERROR:", err);
     res.status(500).json({ ok: false, error: err.message });
@@ -774,6 +805,7 @@ app.post("/upload", async (req, res) => {
 ================================================================ */
 app.post("/test/upload-canto", async (req, res) => {
   const busboy = Busboy({ headers: req.headers });
+
   let domain, fileBuffer, fileName, mimeType;
 
   busboy.on("field", (name, val) => {
@@ -784,6 +816,7 @@ app.post("/test/upload-canto", async (req, res) => {
     const chunks = [];
     fileName = info.filename;
     mimeType = info.mimeType || "application/octet-stream";
+
     file.on("data", d => chunks.push(d));
     file.on("end", () => { fileBuffer = Buffer.concat(chunks); });
   });
@@ -794,19 +827,29 @@ app.post("/test/upload-canto", async (req, res) => {
 
     try {
       const token = await refreshCantoTokenIfNeeded(domain);
-      if (!token?.access_token) return res.status(400).send("Canto token not found");
+      if (!token?.access_token) {
+        return res.status(400).json({ error: "Canto token not found" });
+      }
 
       const out = await uploadToCanto(domain, token.access_token, {
         buffer: fileBuffer,
         filename: fileName,
         mimeType,
-        metadata: {}, // test route keeps it simple
+        metadata: {}
       });
 
-      res.json({ success: true, version: out.version, result: out });
+      // ✅ WRAP response to prevent <html> exploding Express JSON
+      return res.json(
+        scrubHtml({
+          ok: true,
+          version: out.version,
+          result: out
+        })
+      );
+
     } catch (err) {
       console.error("Test upload error:", err);
-      res.status(500).send("Error uploading file.");
+      return res.status(500).json({ error: String(err.message || err) });
     }
   });
 
