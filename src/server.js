@@ -468,13 +468,30 @@ async function cantoRequestUploadSlot(domain, accessToken, filename) {
     }),
   });
 
-  if (!r.ok) {
-    const text = await r.text();
-    throw new Error(`Canto upload-setting failed: ${r.status} — ${text}`);
+  const text = await r.text();
+
+  // HTML → login page → auth problem
+  if (text.trim().startsWith("<")) {
+    console.error("❌ /upload/setting returned HTML — probably invalid token or missing API scope");
+    throw new Error("Canto /upload/setting returned HTML instead of JSON");
   }
 
-  return r.json();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    console.error("❌ /upload/setting returned non-JSON:", text);
+    throw new Error("Canto /upload/setting returned invalid JSON");
+  }
+
+  if (!r.ok) {
+    console.error("❌ upload-setting failed:", data);
+    throw new Error(`Canto upload-setting failed: HTTP ${r.status}`);
+  }
+
+  return data;
 }
+
 
 /**
  * Step 2 – Poll for uploaded file using filename + timestamp
