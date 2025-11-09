@@ -451,43 +451,49 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
 ============================================================ */
 
 /**
- * Step 1 – Request upload slot (S3 info)
+ * Step 1 – Request upload slot (GET /api/v1/upload/setting)
+ * Official Canto flow
  */
 async function cantoRequestUploadSlot(domain, accessToken, filename) {
   const base = tenantApiBase(domain);
+  const url = `${base}/api/v1/upload/setting?fileName=${encodeURIComponent(filename)}`;
 
-  const r = await fetch(`${base}/api/v1/upload/setting`, {
-    method: "POST",
+  const r = await fetch(url, {
+    method: "GET", // ✅ REQUIRED — Canto rejects POST here
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({
-      uploadType: "file",
-      fileName: filename
-    }),
+      Accept: "application/json"
+    }
   });
 
   const text = await r.text();
+
+  // Canto returns HTML (login page) if method is wrong or auth missing
   if (text.trim().startsWith("<")) {
+    console.error("HTML from /upload/setting:", text.substring(0, 200));
     throw new Error("Canto /upload/setting returned HTML instead of JSON");
   }
 
   let data;
-  try { data = JSON.parse(text); }
-  catch { throw new Error("Canto /upload/setting returned non-JSON"); }
-
-  // Normalize shapes across tenants
-  const uploadUrl = data.uploadUrl || data.url;
-  const fields    = data.fields || data.form?.fields || data.form;
-
-  if (!uploadUrl || !fields || typeof fields !== "object") {
-    throw new Error("Canto /upload/setting missing uploadUrl/fields");
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    console.error("Non-JSON from /upload/setting:", text);
+    throw new Error("Canto /upload/setting returned non-JSON");
   }
 
-  return { uploadUrl, fields };
+  if (!data.uploadUrl || !data.fileKey) {
+    console.error("Incomplete upload-setting response:", data);
+    throw new Error("Invalid Canto upload-setting response");
+  }
+
+  return {
+    uploadUrl: data.uploadUrl,
+    fileKey: data.fileKey,
+    fields: data.fields || {}
+  };
 }
+
 
 
 /**
