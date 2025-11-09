@@ -493,43 +493,46 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
  */
 async function cantoRequestUploadSlot(domain, accessToken, filename) {
   const base = tenantApiBase(domain);
-  const url = `${base}/api/v1/upload/setting?fileName=${encodeURIComponent(filename)}`;
 
-  const r = await fetch(url, {
-    method: "GET", // ✅ REQUIRED — Canto rejects POST here
+  const r = await fetch(`${base}/api/v1/upload/setting`, {
+    method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json"
-    }
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      uploadType: "file",
+      fileName: filename
+    }),
   });
 
   const text = await r.text();
-
-  // Canto returns HTML (login page) if method is wrong or auth missing
   if (text.trim().startsWith("<")) {
-    console.error("HTML from /upload/setting:", text.substring(0, 200));
     throw new Error("Canto /upload/setting returned HTML instead of JSON");
   }
 
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch (err) {
-    console.error("Non-JSON from /upload/setting:", text);
+  let json;
+  try { json = JSON.parse(text); } catch {
     throw new Error("Canto /upload/setting returned non-JSON");
   }
 
-  if (!data.uploadUrl || !data.fileKey) {
-    console.error("Incomplete upload-setting response:", data);
-    throw new Error("Invalid Canto upload-setting response");
+  // Normalize common shapes seen in tenants
+  const uploadUrl =
+    json.uploadUrl || json.url || json.upload?.url || json.action;
+
+  const fields =
+    json.fields || json.upload?.fields || json.form || json.data || {};
+
+  const fileKey = json.fileKey || fields.key;
+
+  if (!uploadUrl || !fields || !fileKey) {
+    throw new Error("Canto /upload/setting missing uploadUrl/fields/fileKey");
   }
 
-  return {
-    uploadUrl: data.uploadUrl,
-    fileKey: data.fileKey,
-    fields: data.fields || {}
-  };
+  return { uploadUrl, fields, fileKey, raw: json };
 }
+
 
 
 
