@@ -808,10 +808,18 @@ app.post("/upload", async (req, res) => {
   })
 );
 
-  } catch (err) {
-    console.error("UPLOAD ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
+} catch (err) {
+  console.error("UPLOAD ERROR:", err);
+
+  return res.status(500).json(
+    scrubHtml({
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+      stack: err && err.stack ? err.stack : null
+    })
+  );
+}
+
 });
 
 /* ================================================================
@@ -862,11 +870,18 @@ app.post("/test/upload-canto", async (req, res) => {
         })
       );
 
-    } catch (err) {
-      console.error("Test upload error:", err);
-      return res.status(500).json({ error: String(err.message || err) });
-    }
-  });
+   } catch (err) {
+  console.error("Test upload error:", err);
+
+  return res.status(500).json(
+    scrubHtml({
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+      stack: err && err.stack ? err.stack : null
+    })
+  );
+}
+
 
   req.pipe(busboy);
 });
