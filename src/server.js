@@ -409,13 +409,6 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
 ============================================================ */
 
 /**
- * Base URL helper
- */
-function tenantApiBase(domain) {
-  return `https://${domain}.canto.com`;
-}
-
-/**
  * Step 1 – Request upload slot (S3 info)
  */
 async function cantoRequestUploadSlot(domain, accessToken, filename) {
