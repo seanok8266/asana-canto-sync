@@ -324,6 +324,43 @@ app.get("/oauth/callback/canto", async (req, res) => {
 });
 
 /* ================================================================
+   DEBUG: Check if server can access upload/setting
+================================================================ */
+app.get("/debug/auth-check", async (req, res) => {
+  try {
+    const domain = req.query.domain;
+    if (!domain) return res.status(400).send("Missing domain");
+
+    const token = await refreshCantoTokenIfNeeded(domain);
+    if (!token?.access_token) {
+      return res.status(400).send("No access_token stored for domain");
+    }
+
+    const base = tenantApiBase(domain);
+    const url = `${base}/api/v1/upload/setting?fileName=ping.jpg`;
+
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token.access_token}`,
+        Accept: "application/json"
+      }
+    });
+
+    const text = await r.text();
+
+    res.json({
+      domain,
+      httpStatus: r.status,
+      startsWithHtml: text.startsWith("<"),
+      textSample: text.slice(0, 200),
+      tokenStarts: token.access_token.substring(0, 8)
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+/* ================================================================
    DEBUG: raw tenant /upload/setting inspector
    Helps inspect the exact response shape from the tenant API
 ================================================================ */
