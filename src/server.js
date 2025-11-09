@@ -404,153 +404,141 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
   return data;
 }
 
-/* ================================================================
-   CANTO v2 (aka “upload/setting”) HELPERS
-   Flow:
-     1) GET {tenant}/api/v1/upload/setting
-     2) POST multipart form to S3 (uploadUrl + fields + file)
-     3) Find new file (by s3Key or by filename)
-     4) PATCH metadata to /api/v1/files/{id}
-================================================================ */
-async function cantoGetUploadSettingV2(domain, accessToken, { filename }) {
-  const base = tenantApiBase(domain);
-  const url = new URL(`${base}/api/v1/upload/setting`);
-  if (filename) url.searchParams.set("fileName", filename);
+/* ============================================================
+   CANTO UPLOAD (v2) – Integrated Full Pipeline
+============================================================ */
 
-  const r = await fetch(url.toString(), {
+/**
+ * Base URL helper
+ */
+function tenantApiBase(domain) {
+  return `https://${domain}.canto.com`;
+}
+
+/**
+ * Step 1 – Request upload slot (S3 info)
+ */
+async function cantoRequestUploadSlot(domain, accessToken, filename) {
+  const base = tenantApiBase(domain);
+
+  const r = await fetch(`${base}/api/v1/upload/setting`, {
+    method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify({
+      uploadType: "file",
+      fileName: filename
+    }),
   });
-
-  const text = await r.text();
-  let raw; 
-  try { raw = JSON.parse(text); } 
-  catch { throw new Error("upload/setting did not return JSON"); }
 
   if (!r.ok) {
-    console.error("[v2 upload/setting] HTTP", r.status, raw);
-    throw new Error("Canto v2 upload/setting failed");
+    const text = await r.text();
+    throw new Error(`Canto upload-setting failed: ${r.status} — ${text}`);
   }
 
-  // ✅ Your tenant uses:
-  //   url = upload URL
-  //   key = key prefix
-  //   other properties = multipart fields
-  if (raw.url && raw.key && raw.Policy) {
-    const { url: uploadUrl, key, ...rest } = raw;
-
-    const fields = {
-      ...rest,
-      key,
-      // substitute ${filename}
-      "x-amz-meta-file_name": filename,
-    };
-
-    return { uploadUrl, fields, s3Key: key.replace("${filename}", filename) };
-  }
-
-  // ✅ Standard v2 handling (fallback)
-  const fields = raw.fields || raw.params;
-  if (!raw.uploadUrl || !fields) {
-    console.error("[v2 upload/setting] missing uploadUrl/fields:", raw);
-    throw new Error("Canto v2 upload/setting incomplete response");
-  }
-
-  const s3Key = fields.key || raw.key || null;
-  return { uploadUrl: raw.uploadUrl, fields, s3Key };
+  return r.json();
 }
 
-
-async function s3MultipartPost(uploadUrl, fields, fileBuffer, fileName, mimeType) {
-  const form = new FormData();
-  Object.entries(fields).forEach(([k, v]) => form.append(k, String(v)));
-  form.append("file", fileBuffer, { filename: fileName, contentType: mimeType });
-
-  const r = await fetch(uploadUrl, {
-    method: "POST",
-    headers: form.getHeaders(),
-    body: form,
-  });
-
-  // S3 often returns 204 or 201 (sometimes 200)
-  if (!r.ok && r.status !== 204 && r.status !== 201) {
-    const t = await r.text();
-    console.error("[S3 multipart POST] failed:", r.status, t);
-    throw new Error("S3 multipart POST failed");
-  }
-}
-
+/**
+ * Step 2 – Poll for uploaded file using filename + timestamp
+ */
 async function cantoFindUploadedFileV2(
   domain,
   accessToken,
-  { filename, s3Key },
-  { tries = 10, delayMs = 1000 } = {}
+  { filename, uploadStartMs },
+  { tries = 10, delayMs = 1200 } = {}
 ) {
   const base = tenantApiBase(domain);
+
+  const normalizedFilename = filename.toLowerCase().trim();
+  const filenameStem = normalizedFilename.replace(/\.[^.]+$/, "");
+  const fileExt = normalizedFilename.split(".").pop();
+
+  // Canto timestamps: "20241017080426000"
+  function cantoTimeToMs(t) {
+    if (!t) return 0;
+    return +t.substring(0, 14);
+  }
 
   function matches(item) {
     if (!item) return false;
 
-    return (
-      item.originalName === filename ||
-      item.name === filename ||
-      item.original_filename === filename ||
-      item?.metadata?.original_filename === filename ||
+    const name = (item.name || item.originalName || "").toLowerCase();
 
-      // Some tenants return nested asset object
-      item?._embedded?.asset?.originalName === filename ||
-      item?._embedded?.asset?.name === filename ||
-      item?._embedded?.asset?.original_filename === filename ||
+    // must match extension
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    if (ext !== fileExt) return false;
 
-      // fallback: sometimes Canto stores only basename
-      (item.key && item.key.endsWith("/" + filename))
-    );
+    // stem match
+    if (!name.includes(filenameStem)) return false;
+
+    // created after upload began
+    const createdMs = cantoTimeToMs(item.time);
+    if (createdMs && createdMs < uploadStartMs) return false;
+
+    return true;
   }
 
-  // ✅ Try s3Key search first
-  if (s3Key) {
-    for (let i = 0; i < tries; i++) {
-      let res;
-      try {
-        res = await fetch(`${base}/api/v1/search?s3Key=${encodeURIComponent(s3Key)}`, {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        });
-      } catch {}
-
-      if (res?.ok) {
-        const text = await res.text();
-        let data;
-        try { data = JSON.parse(text); } catch { data = {}; }
-
-        const items = data.items || data.results || [];
-        if (items.length > 0) return items[0];
-      }
-
-      await new Promise(r => setTimeout(r, delayMs));
-    }
-  }
-
-  // ✅ Try file-name based search (recent items)
-  for (let i = 0; i < tries; i++) {
-    let res;
+  // API: POST /api/v1/search
+  async function searchByName() {
     try {
-      res = await fetch(`${base}/api/v1/files/recent`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+      const body = {
+        search: {
+          query: normalizedFilename,
+          types: ["files"]
+        }
+      };
+
+      const r = await fetch(`${base}/api/v1/search`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
       });
-    } catch {}
 
-    if (res?.ok) {
-      const text = await res.text();
-      let data;
-      try { data = JSON.parse(text); } catch { data = {}; }
-
-      const list = data.items || [];
-      const item = list.find(matches);
-      if (item) return item;
+      if (!r.ok) return [];
+      const d = await r.json();
+      return d.results || d.items || [];
+    } catch {
+      return [];
     }
+  }
 
+  // API: GET /api/v1/files/recent
+  async function fetchRecent() {
+    try {
+      const r = await fetch(`${base}/api/v1/files/recent?count=50`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      if (!r.ok) return [];
+      const d = await r.json();
+      return d.items || [];
+    } catch {
+      return [];
+    }
+  }
+
+  // Wait for ingestion start
+  await new Promise(r => setTimeout(r, 1500));
+
+  // Pass 1: search API
+  for (let i = 0; i < tries; i++) {
+    const list = await searchByName();
+    const found = list.find(matches);
+    if (found) return found;
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+
+  // Pass 2: recent files
+  for (let i = 0; i < tries; i++) {
+    const list = await fetchRecent();
+    const found = list.find(matches);
+    if (found) return found;
     await new Promise(r => setTimeout(r, delayMs));
   }
 
@@ -558,88 +546,89 @@ async function cantoFindUploadedFileV2(
 }
 
 
-async function cantoPatchMetadataV2(domain, accessToken, fileId, metadataObj) {
-  if (!metadataObj || Object.keys(metadataObj).length === 0) {
-    return { skipped: true };
+/**
+ * Step 3 – Patch metadata using batch edit
+ */
+async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {}) {
+  if (!metadata || Object.keys(metadata).length === 0) {
+    return { ok: true, skipped: true };
   }
 
   const base = tenantApiBase(domain);
-  const url = `${base}/api/v1/batch/content/apply`;
 
-  const r = await fetch(url, {
+  const body = {
+    files: [assetId],
+    metadata
+  };
+
+  const r = await fetch(`${base}/api/v1/files/update`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      ids: [fileId],
-      metadata: metadataObj
-    }),
+    body: JSON.stringify(body)
   });
 
   const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
   if (!r.ok) {
-    console.error("[v2 batch apply] HTTP", r.status, data);
-    return { skipped: true };
+    return { ok: false, error: text };
   }
 
-  return data;
+  return { ok: true, raw: text };
 }
 
 
-/* ================================================================
-   UNIFIED UPLOAD DISPATCHER
-================================================================ */
-async function uploadToCanto(domain, accessToken, { buffer, filename, mimeType, metadata }) {
-  // figure out which flow this tenant uses
-  let ver = (await getToken(domain))?.uploadVersion;
-  if (!ver) ver = await detectUploadVersion(domain, accessToken);
+/**
+ * Step 4 – Combined: upload physical file + find it + patch metadata
+ */
+async function cantoUploadFileV2(domain, accessToken, file, metadata = {}) {
+  const filename = file.originalname || file.name;
 
-  if (ver === "v3") {
-    // v3: oauth host
-    const created = await cantoCreateUploadV3(accessToken, {
-      filename, size: buffer.length, mimeType
-    });
-    await s3PutSignedUrl(created.uploadUrl, buffer, mimeType);
-    const file = await cantoFinalizeFileV3(accessToken, {
-      uploadId: created.uploadId,
-      filename,
-      metadata
-    });
-    // v3 response usually includes file info with id/links
-    return { version: "v3", file };
+  // mark upload start time for ingestion filtering
+  const uploadStartMs = Date.now();
+
+  // 1) request upload slot
+  const setting = await cantoRequestUploadSlot(domain, accessToken, filename);
+
+  if (!setting?.uploadUrl || !setting?.fileKey) {
+    throw new Error("Invalid Canto upload-setting response");
   }
 
-  // v2: tenant upload/setting
-  const setting = await cantoGetUploadSettingV2(domain, accessToken, { filename });
-  await s3MultipartPost(setting.uploadUrl, setting.fields, buffer, filename, mimeType);
+  // 2) upload to S3 (putObject)
+  const uploadR = await fetch(setting.uploadUrl, {
+    method: "PUT",
+    headers: {
+      "Content-Type": file.mimetype || "application/octet-stream",
+    },
+    body: file.buffer
+  });
 
-  // try to find it (by s3Key or filename)
-  const uploaded = await cantoFindUploadedFileV2(
+  if (!uploadR.ok) {
+    const t = await uploadR.text();
+    throw new Error(`S3 upload failed: ${t}`);
+  }
+
+  // 3) find ingested asset
+  const found = await cantoFindUploadedFileV2(
     domain,
     accessToken,
-    { filename, s3Key: setting.s3Key },
-    { tries: 10, delayMs: 800 }
+    { filename, uploadStartMs }
   );
 
-  // then patch metadata
-  const patched = await cantoPatchMetadataV2(domain, accessToken, uploaded.id, metadata || {});
-  return {
-  ok: true,
-  version: "v2",
-  domain,
-  filename,
-  assetUrl: uploaded.url?.detail || null,
-  assetPreview: uploaded.url?.preview || null,
-  cantoFile: patched,
-  found: uploaded
-};
+  // 4) patch metadata
+  const metaRes = await cantoPatchMetadataV2(domain, accessToken, found.id, metadata);
 
+  return {
+    ok: true,
+    domain,
+    version: "v2",
+    filename,
+    found,
+    metadataStatus: metaRes
+  };
 }
+
 
 /* ================================================================
    ROUTE: POST /upload
