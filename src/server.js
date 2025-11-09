@@ -54,6 +54,21 @@ function filenameFromUrl(urlStr) {
 }
 
 /* ================================================================
+   SAFE JSON PARSER — prevents HTML from breaking uploads
+================================================================ */
+async function safeJson(res) {
+  const text = await res.text();
+  if (text.trim().startsWith("<")) {
+    return { __html: text };
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { __raw: text };
+  }
+}
+
+/* ================================================================
    CLEANUP: Strip HTML responses from objects before JSON output
 ================================================================ */
 function scrubHtml(input) {
@@ -476,7 +491,6 @@ async function cantoFindUploadedFileV2(
   const filenameStem = normalizedFilename.replace(/\.[^.]+$/, "");
   const fileExt = normalizedFilename.split(".").pop();
 
-  // Canto timestamps: "20241017080426000"
   function cantoTimeToMs(t) {
     if (!t) return 0;
     return +t.substring(0, 14);
@@ -486,22 +500,17 @@ async function cantoFindUploadedFileV2(
     if (!item) return false;
 
     const name = (item.name || item.originalName || "").toLowerCase();
-
-    // must match extension
     const ext = (name.split(".").pop() || "").toLowerCase();
     if (ext !== fileExt) return false;
-
-    // stem match
     if (!name.includes(filenameStem)) return false;
 
-    // created after upload began
     const createdMs = cantoTimeToMs(item.time);
     if (createdMs && createdMs < uploadStartMs) return false;
 
     return true;
   }
 
-  // API: POST /api/v1/search
+  // Wrap search API with HTML-safe JSON
   async function searchByName() {
     try {
       const body = {
@@ -520,30 +529,40 @@ async function cantoFindUploadedFileV2(
         body: JSON.stringify(body)
       });
 
-      if (!r.ok) return [];
-      const d = await r.json();
+      const d = await safeJson(r);
+
+      if (d.__html || d.__raw) {
+        console.warn("⚠️ Canto returned HTML/non-JSON for search API");
+        return [];
+      }
+
       return d.results || d.items || [];
     } catch {
       return [];
     }
   }
 
-  // API: GET /api/v1/files/recent
+  // Wrap recent-files API with HTML-safe JSON
   async function fetchRecent() {
     try {
       const r = await fetch(`${base}/api/v1/files/recent?count=50`, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
 
-      if (!r.ok) return [];
-      const d = await r.json();
+      const d = await safeJson(r);
+
+      if (d.__html || d.__raw) {
+        console.warn("⚠️ Canto returned HTML/non-JSON for recent API");
+        return [];
+      }
+
       return d.items || [];
     } catch {
       return [];
     }
   }
 
-  // Wait for ingestion start
+  // Wait for ingestion
   await new Promise(r => setTimeout(r, 1500));
 
   // Pass 1: search API
@@ -551,14 +570,16 @@ async function cantoFindUploadedFileV2(
     const list = await searchByName();
     const found = list.find(matches);
     if (found) return found;
+
     await new Promise(r => setTimeout(r, delayMs));
   }
 
-  // Pass 2: recent files
+  // Pass 2: recent files API
   for (let i = 0; i < tries; i++) {
     const list = await fetchRecent();
     const found = list.find(matches);
     if (found) return found;
+
     await new Promise(r => setTimeout(r, delayMs));
   }
 
@@ -592,47 +613,41 @@ async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {})
     body: JSON.stringify(body)
   });
 
-  const text = await r.text();
+  const parsed = await safeJson(r);
 
-  // ✅ HTML response means metadata API isn't enabled (HTML = login page)
-  if (text.trim().startsWith("<")) {
-    console.warn(
-      `⚠️ Metadata disabled for ${domain}: endpoint returned HTML, skipping metadata patch`
-    );
+  // HTML → metadata API disabled by tenant configuration
+  if (parsed.__html) {
+    console.warn(`⚠️ Metadata API disabled for ${domain}`);
     return {
       ok: true,
       skipped: true,
-      reason: "metadata API disabled on tenant",
-      raw: text
+      reason: "metadata API disabled (HTML response)",
+      raw: parsed.__html
     };
   }
 
-  // ✅ Try JSON
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
+  // Non-JSON → soft skip
+  if (parsed.__raw) {
     return {
       ok: true,
       skipped: true,
-      reason: "non-JSON response, metadata skipped",
-      raw: text
+      reason: "non-JSON metadata response",
+      raw: parsed.__raw
     };
   }
 
-  // ✅ If status bad, return soft error but don’t break upload
   if (!r.ok) {
     return {
       ok: false,
       skipped: true,
       reason: "metadata API rejected request",
-      error: data
+      error: parsed
     };
   }
 
-  // ✅ Success
-  return { ok: true, patched: true, response: data };
+  return { ok: true, patched: true, response: parsed };
 }
+
 
 /**
  * Step 4 – Combined: upload physical file + find it + patch metadata
