@@ -456,37 +456,27 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
 async function cantoRequestUploadSlot(domain, accessToken, filename) {
   const base = tenantApiBase(domain);
 
-  const r = await fetch(`${base}/api/v1/upload/setting`, {
-    method: "POST",
+  const url = `${base}/api/v1/upload/setting?fileName=${encodeURIComponent(filename)}`;
+
+  const r = await fetch(url, {
+    method: "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      uploadType: "file",
-      fileName: filename
-    }),
+      Accept: "application/json"
+    }
   });
 
   const text = await r.text();
 
-  // HTML → login page → auth problem
   if (text.trim().startsWith("<")) {
-    console.error("❌ /upload/setting returned HTML — probably invalid token or missing API scope");
-    throw new Error("Canto /upload/setting returned HTML instead of JSON");
+    throw new Error("Canto /upload/setting returned HTML (token or permissions issue)");
   }
 
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    console.error("❌ /upload/setting returned non-JSON:", text);
-    throw new Error("Canto /upload/setting returned invalid JSON");
-  }
-
-  if (!r.ok) {
-    console.error("❌ upload-setting failed:", data);
-    throw new Error(`Canto upload-setting failed: HTTP ${r.status}`);
+    throw new Error("Canto /upload/setting returned non-JSON");
   }
 
   return data;
