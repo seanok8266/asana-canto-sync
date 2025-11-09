@@ -559,28 +559,37 @@ async function cantoFindUploadedFileV2(
 
 
 async function cantoPatchMetadataV2(domain, accessToken, fileId, metadataObj) {
+  if (!metadataObj || Object.keys(metadataObj).length === 0) {
+    return { skipped: true };
+  }
+
   const base = tenantApiBase(domain);
-  const url = `${base}/api/v1/files/${encodeURIComponent(fileId)}`;
+  const url = `${base}/api/v1/batch/content/apply`;
 
   const r = await fetch(url, {
-    method: "PATCH",
+    method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
-    body: JSON.stringify({ metadata: metadataObj || {} }),
+    body: JSON.stringify({
+      ids: [fileId],
+      metadata: metadataObj
+    }),
   });
 
   const text = await r.text();
   let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
   if (!r.ok) {
-    console.error("[v2 PATCH metadata] HTTP", r.status, data);
-    throw new Error("Canto v2 metadata patch failed");
+    console.error("[v2 batch apply] HTTP", r.status, data);
+    return { skipped: true };
   }
+
   return data;
 }
+
 
 /* ================================================================
    UNIFIED UPLOAD DISPATCHER
