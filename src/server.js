@@ -479,113 +479,67 @@ async function cantoRequestUploadSlot(domain, accessToken, filename) {
 /**
  * Step 2 – Poll for uploaded file using filename + timestamp
  */
+/**
+ * Official Canto — Find uploaded file using /api/v1/upload/status
+ * Recommended by Canto Support
+ */
 async function cantoFindUploadedFileV2(
   domain,
   accessToken,
   { filename, uploadStartMs },
-  { tries = 10, delayMs = 1200 } = {}
+  { tries = 12, delayMs = 1500 } = {}
 ) {
   const base = tenantApiBase(domain);
+  const normalized = filename.toLowerCase();
 
-  const normalizedFilename = filename.toLowerCase().trim();
-  const filenameStem = normalizedFilename.replace(/\.[^.]+$/, "");
-  const fileExt = normalizedFilename.split(".").pop();
-
-  function cantoTimeToMs(t) {
-    if (!t) return 0;
-    return +t.substring(0, 14);
-  }
-
-  function matches(item) {
-    if (!item) return false;
-
-    const name = (item.name || item.originalName || "").toLowerCase();
-    const ext = (name.split(".").pop() || "").toLowerCase();
-    if (ext !== fileExt) return false;
-    if (!name.includes(filenameStem)) return false;
-
-    const createdMs = cantoTimeToMs(item.time);
-    if (createdMs && createdMs < uploadStartMs) return false;
-
-    return true;
-  }
-
-  // Wrap search API with HTML-safe JSON
-  async function searchByName() {
-    try {
-      const body = {
-        search: {
-          query: normalizedFilename,
-          types: ["files"]
-        }
-      };
-
-      const r = await fetch(`${base}/api/v1/search`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
-      });
-
-      const d = await safeJson(r);
-
-      if (d.__html || d.__raw) {
-        console.warn("⚠️ Canto returned HTML/non-JSON for search API");
-        return [];
-      }
-
-      return d.results || d.items || [];
-    } catch {
-      return [];
-    }
-  }
-
-  // Wrap recent-files API with HTML-safe JSON
-  async function fetchRecent() {
-    try {
-      const r = await fetch(`${base}/api/v1/files/recent?count=50`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-
-      const d = await safeJson(r);
-
-      if (d.__html || d.__raw) {
-        console.warn("⚠️ Canto returned HTML/non-JSON for recent API");
-        return [];
-      }
-
-      return d.items || [];
-    } catch {
-      return [];
-    }
-  }
-
-  // Wait for ingestion
-  await new Promise(r => setTimeout(r, 1500));
-
-  // Pass 1: search API
   for (let i = 0; i < tries; i++) {
-    const list = await searchByName();
-    const found = list.find(matches);
-    if (found) return found;
+    const url = `${base}/api/v1/upload/status?hours=1`;
+
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json"
+      }
+    });
+
+    const text = await r.text();
+
+    // HTML → tenant not returning API JSON
+    if (text.trim().startsWith("<")) {
+      console.warn("⚠️ upload/status returned HTML — possible auth/config issue");
+      await new Promise(r => setTimeout(r, delayMs));
+      continue;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      console.warn("⚠️ upload/status returned non-JSON:", text);
+      await new Promise(r => setTimeout(r, delayMs));
+      continue;
+    }
+
+    const items = data.items || data.results || [];
+
+    for (const item of items) {
+      const name = (item.name || item.originalName || "").toLowerCase();
+      if (!name.includes(normalized)) continue;
+
+      // convert Canto timestamp → ms
+      const createdMs = Number(item.time?.substring(0, 14)) || 0;
+
+      // ensure it was uploaded after this integration’s upload started
+      if (createdMs < uploadStartMs) continue;
+
+      return item;  // ✅ FOUND
+    }
 
     await new Promise(r => setTimeout(r, delayMs));
   }
 
-  // Pass 2: recent files API
-  for (let i = 0; i < tries; i++) {
-    const list = await fetchRecent();
-    const found = list.find(matches);
-    if (found) return found;
-
-    await new Promise(r => setTimeout(r, delayMs));
-  }
-
-  throw new Error("Uploaded file not found after polling");
+  throw new Error("Upload finished but file not found in upload/status");
 }
-
 
 /**
  * Step 3 – Patch metadata using batch edit
