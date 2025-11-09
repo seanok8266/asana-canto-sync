@@ -567,36 +567,24 @@ async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {})
 
   const text = await r.text();
 
-  if (!r.ok) {
-    return { ok: false, error: text };
-  }
-
-  let data;
-  try { data = JSON.parse(text); }
-  catch { data = { raw: text }; }
-
-  return { ok: true, data };
-}
-
-
-  // ✅ Detect HTML response → means tenant does NOT have metadata API enabled
+  // ✅ HTML response means metadata API isn't enabled (HTML = login page)
   if (text.trim().startsWith("<")) {
     console.warn(
-      `⚠️  Metadata disabled for ${domain}: endpoint returned HTML, skipping metadata patch`
+      `⚠️ Metadata disabled for ${domain}: endpoint returned HTML, skipping metadata patch`
     );
     return {
       ok: true,
       skipped: true,
-      reason: "metadata API disabled on tenant"
+      reason: "metadata API disabled on tenant",
+      raw: text
     };
   }
 
-  // Try parsing JSON if possible
+  // ✅ Try JSON
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    // Non-JSON but not HTML (rare) → still treat as soft skip
     return {
       ok: true,
       skipped: true,
@@ -605,12 +593,8 @@ async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {})
     };
   }
 
-  // If HTTP status is not OK → return error, but no crash
+  // ✅ If status bad, return soft error but don’t break upload
   if (!r.ok) {
-    console.warn(
-      `⚠️ Metadata patch failed for ${domain}:`,
-      data
-    );
     return {
       ok: false,
       skipped: true,
@@ -622,7 +606,6 @@ async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {})
   // ✅ Success
   return { ok: true, patched: true, response: data };
 }
-
 
 /**
  * Step 4 – Combined: upload physical file + find it + patch metadata
