@@ -523,17 +523,17 @@ async function cantoFindUploadedFileV2(
     const items = data.items || data.results || [];
 
     for (const item of items) {
-      const name = (item.name || item.originalName || "").toLowerCase();
-      if (!name.includes(normalized)) continue;
+  const name = (item.name || item.originalName || "").toLowerCase();
 
-      // convert Canto timestamp → ms
-      const createdMs = Number(item.time?.substring(0, 14)) || 0;
+  const stem = normalized.replace(/\.[^.]+$/, "");
+  if (!name.includes(stem)) continue;
 
-      // ensure it was uploaded after this integration’s upload started
-      if (createdMs < uploadStartMs) continue;
+  const createdMs = Number(item.time?.substring(0, 14)) || 0;
+  if (createdMs < uploadStartMs) continue;
 
-      return item;  // ✅ FOUND
-    }
+  return item;
+}
+
 
     await new Promise(r => setTimeout(r, delayMs));
   }
