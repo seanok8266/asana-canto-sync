@@ -545,28 +545,39 @@ async function cantoFindUploadedFileV2(
  * If the tenant returns HTML (login page), metadata is skipped gracefully.
  */
 async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {}) {
-  // If no metadata provided → skip
   if (!metadata || Object.keys(metadata).length === 0) {
-    return { ok: true, skipped: true, reason: "empty metadata" };
+    return { ok: true, skipped: true };
   }
 
   const base = tenantApiBase(domain);
-  const url = `${base}/api/v1/files/update`;
 
-  const r = await fetch(url, {
+  const body = {
+    fileIds: [assetId],
+    metadata
+  };
+
+  const r = await fetch(`${base}/api/v1/files/batch/edit/apply`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "application/json"
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      files: [assetId],
-      metadata
-    })
+    body: JSON.stringify(body)
   });
 
   const text = await r.text();
+
+  if (!r.ok) {
+    return { ok: false, error: text };
+  }
+
+  let data;
+  try { data = JSON.parse(text); }
+  catch { data = { raw: text }; }
+
+  return { ok: true, data };
+}
+
 
   // ✅ Detect HTML response → means tenant does NOT have metadata API enabled
   if (text.trim().startsWith("<")) {
