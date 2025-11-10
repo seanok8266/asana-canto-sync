@@ -483,18 +483,23 @@ async function cantoFinalizeFileV3(accessToken, { uploadId, filename, metadata }
    return scrubHtml(data);
 }
 
-/* ============================================================
-   CANTO UPLOAD (v2) – Integrated Full Pipeline
-============================================================ */
+/* ===================================================================
+   CANTO UPLOAD (v2) – Verified Official Flow (Support-Approved)
+   Steps:
+      1. POST   /api/v1/upload/setting     → get S3 form fields
+      2. POST   S3 multi-part form upload  → upload file
+      3. GET    /api/v1/upload/status      → find uploaded asset
+      4. POST   /api/v1/files/batch/edit/apply  → metadata (optional)
+=================================================================== */
 
-/**
- * Step 1 – Request upload slot (GET /api/v1/upload/setting)
- * Official Canto flow
- */
+
+/* ---------------------------------------------------------------
+   STEP 1: Request upload slot
+---------------------------------------------------------------- */
 async function cantoRequestUploadSlot(domain, accessToken, filename) {
   const base = tenantApiBase(domain);
 
-  const r = await fetch(`${base}/api/v1/upload/setting`, {
+  const resp = await fetch(`${base}/api/v1/upload/setting`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -503,46 +508,75 @@ async function cantoRequestUploadSlot(domain, accessToken, filename) {
     },
     body: JSON.stringify({
       uploadType: "file",
-      fileName: filename
+      fileName: filename,
     }),
   });
 
-  const text = await r.text();
+  const text = await resp.text();
+
   if (text.trim().startsWith("<")) {
     throw new Error("Canto /upload/setting returned HTML instead of JSON");
   }
 
   let json;
-  try { json = JSON.parse(text); } catch {
+  try {
+    json = JSON.parse(text);
+  } catch {
     throw new Error("Canto /upload/setting returned non-JSON");
   }
 
-  // Normalize common shapes seen in tenants
   const uploadUrl =
-    json.uploadUrl || json.url || json.upload?.url || json.action;
+    json.uploadUrl || json.url || json.action || json.upload?.url;
 
   const fields =
     json.fields || json.upload?.fields || json.form || json.data || {};
 
   const fileKey = json.fileKey || fields.key;
 
-  if (!uploadUrl || !fields || !fileKey) {
-    throw new Error("Canto /upload/setting missing uploadUrl/fields/fileKey");
+  if (!uploadUrl || !fileKey) {
+    throw new Error("Canto /upload/setting missing uploadUrl or key");
   }
 
-  return { uploadUrl, fields, fileKey, raw: json };
+  return { uploadUrl, fields, fileKey };
 }
 
 
+/* ---------------------------------------------------------------
+   STEP 2: Upload file via S3 Form POST
+---------------------------------------------------------------- */
+async function cantoS3FormUpload({ uploadUrl, fields, file }) {
+  const fd = new FormData();
+
+  // Append all required policy/credential fields
+  for (const [k, v] of Object.entries(fields)) {
+    fd.append(k, v);
+  }
+
+  // Append the actual file (must be named "file")
+  fd.append(
+    "file",
+    file.buffer,
+    file.originalname || file.name || "upload.bin"
+  );
+
+  const s3Res = await fetch(uploadUrl, {
+    method: "POST",
+    body: fd,
+    headers: fd.getHeaders ? fd.getHeaders() : undefined,
+  });
+
+  // S3 usually returns 204 (No Content), sometimes 201/200
+  if (![200, 201, 204].includes(s3Res.status)) {
+    const errText = await s3Res.text().catch(() => "");
+    throw new Error(`S3 upload failed (${s3Res.status}) ${errText}`);
+  }
+}
 
 
-/**
- * Step 2 – Poll for uploaded file using filename + timestamp
- */
-/**
- * Official Canto — Find uploaded file using /api/v1/upload/status
- * Recommended by Canto Support
- */
+/* ---------------------------------------------------------------
+   STEP 3: Find uploaded asset using /upload/status
+   (Support explicitly confirmed this is the official method)
+---------------------------------------------------------------- */
 async function cantoFindUploadedFileV2(
   domain,
   accessToken,
@@ -551,31 +585,29 @@ async function cantoFindUploadedFileV2(
 ) {
   const base = tenantApiBase(domain);
   const normalized = filename.toLowerCase();
+  const stem = normalized.replace(/\.[^.]+$/, "");
 
   for (let i = 0; i < tries; i++) {
-    const url = `${base}/api/v1/upload/status?hours=1`;
-
-    const r = await fetch(url, {
+    const resp = await fetch(`${base}/api/v1/upload/status?hours=1`, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
-        Accept: "application/json"
-      }
+        Accept: "application/json",
+      },
     });
 
-    const text = await r.text();
+    const raw = await resp.text();
 
-    // HTML → tenant not returning API JSON
-    if (text.trim().startsWith("<")) {
-      console.warn("⚠️ upload/status returned HTML — possible auth/config issue");
+    if (raw.trim().startsWith("<")) {
+      console.warn("⚠️ upload/status returned HTML, retrying…");
       await new Promise(r => setTimeout(r, delayMs));
       continue;
     }
 
     let data;
     try {
-      data = JSON.parse(text);
+      data = JSON.parse(raw);
     } catch {
-      console.warn("⚠️ upload/status returned non-JSON:", text);
+      console.warn("⚠️ upload/status returned non-JSON:", raw);
       await new Promise(r => setTimeout(r, delayMs));
       continue;
     }
@@ -583,79 +615,69 @@ async function cantoFindUploadedFileV2(
     const items = data.items || data.results || [];
 
     for (const item of items) {
-  const name = (item.name || item.originalName || "").toLowerCase();
+      const name = (item.name || item.originalName || "").toLowerCase();
+      if (!name.includes(stem)) continue;
 
-  const stem = normalized.replace(/\.[^.]+$/, "");
-  if (!name.includes(stem)) continue;
+      const createdMs = Number(item.time?.substring(0, 14)) || 0;
+      if (createdMs < uploadStartMs) continue;
 
-  const createdMs = Number(item.time?.substring(0, 14)) || 0;
-  if (createdMs < uploadStartMs) continue;
-
-  return item;
-}
-
+      return item; // ✅ FOUND
+    }
 
     await new Promise(r => setTimeout(r, delayMs));
   }
 
-  throw new Error("Upload finished but file not found in upload/status");
+  throw new Error("Upload completed but file not found via upload/status");
 }
 
-/**
- * Step 3 – Patch metadata using batch edit
- * Auto-detects whether the tenant supports metadata write API.
- * If the tenant returns HTML (login page), metadata is skipped gracefully.
- */
+
+/* ---------------------------------------------------------------
+   STEP 4: Patch metadata (optional, may be disabled per tenant)
+---------------------------------------------------------------- */
 async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {}) {
   if (!metadata || Object.keys(metadata).length === 0) {
     return { ok: true, skipped: true };
   }
 
   const base = tenantApiBase(domain);
-
-  const body = {
-    fileIds: [assetId],
-    metadata
-  };
-
-  const r = await fetch(`${base}/api/v1/files/batch/edit/apply`, {
+  const resp = await fetch(`${base}/api/v1/files/batch/edit/apply`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      fileIds: [assetId],
+      metadata,
+    }),
   });
 
-  const parsed = await safeJson(r);
+  const parsed = await safeJson(resp);
 
-  // HTML → metadata API disabled by tenant configuration
   if (parsed.__html) {
-    console.warn(`⚠️ Metadata API disabled for ${domain}`);
     return {
       ok: true,
       skipped: true,
       reason: "metadata API disabled (HTML response)",
-      raw: parsed.__html
+      raw: parsed.__html,
     };
   }
 
-  // Non-JSON → soft skip
   if (parsed.__raw) {
     return {
       ok: true,
       skipped: true,
       reason: "non-JSON metadata response",
-      raw: parsed.__raw
+      raw: parsed.__raw,
     };
   }
 
-  if (!r.ok) {
+  if (!resp.ok) {
     return {
       ok: false,
       skipped: true,
-      reason: "metadata API rejected request",
-      error: parsed
+      reason: "metadata rejected",
+      error: parsed,
     };
   }
 
@@ -663,67 +685,44 @@ async function cantoPatchMetadataV2(domain, accessToken, assetId, metadata = {})
 }
 
 
-/**
- * Step 4 – Combined: upload physical file + find it + patch metadata
- */
+/* ---------------------------------------------------------------
+   MASTER: Complete v2 Upload Pipeline
+---------------------------------------------------------------- */
 async function cantoUploadFileV2(domain, accessToken, file, metadata = {}) {
   const filename = file.originalname || file.name;
-
-  // mark upload start time for ingestion filtering
   const uploadStartMs = Date.now();
 
-  // 1) request upload slot
+  // 1) Request upload slot
   const setting = await cantoRequestUploadSlot(domain, accessToken, filename);
 
-  if (!setting?.uploadUrl || !setting?.fileKey) {
-    throw new Error("Invalid Canto upload-setting response");
-  }
+  // 2) Upload file via S3 Form POST
+  await cantoS3FormUpload({
+    uploadUrl: setting.uploadUrl,
+    fields: setting.fields,
+    file,
+  });
 
-  // 2) upload to S3 (multipart POST with policy fields)
-{
-  const fd = new FormData();
-  // Required policy fields from Canto
-  for (const [k, v] of Object.entries(setting.fields)) {
-    fd.append(k, v);
-  }
-  // The actual file must be the last part, field name literally "file"
-  fd.append("file", file.buffer, {
+  // 3) Locate final asset
+  const found = await cantoFindUploadedFileV2(domain, accessToken, {
     filename,
-    contentType: file.mimetype || "application/octet-stream",
-    knownLength: file.buffer.length
+    uploadStartMs,
   });
 
-  const s3Res = await fetch(setting.uploadUrl, {
-    method: "POST",
-    body: fd,
-    headers: fd.getHeaders ? fd.getHeaders() : undefined
-  });
-
-  // S3 may return 204 No Content, 201 (XML), or 200
-  if (![200, 201, 204].includes(s3Res.status)) {
-    const errText = await s3Res.text().catch(() => "");
-    throw new Error(`S3 POST failed (${s3Res.status}) ${errText}`);
-  }
-}
-
-
-  // 3) find ingested asset
-  const found = await cantoFindUploadedFileV2(
+  // 4) Patch metadata
+  const metaRes = await cantoPatchMetadataV2(
     domain,
     accessToken,
-    { filename, uploadStartMs }
+    found.id,
+    metadata
   );
-
-  // 4) patch metadata
-  const metaRes = await cantoPatchMetadataV2(domain, accessToken, found.id, metadata);
 
   return {
     ok: true,
-    domain,
     version: "v2",
+    domain,
     filename,
     found,
-    metadataStatus: metaRes
+    metadataStatus: metaRes,
   };
 }
 
