@@ -394,6 +394,46 @@ app.get("/debug/upload-setting", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+/* ================================================================
+   DEBUG: REAL upload-setting call using your OAuth token
+================================================================ */
+app.get("/debug/upload-setting-live", async (req, res) => {
+  try {
+    const domain = "thedamconsultants";
+
+    const token = await refreshCantoTokenIfNeeded(domain);
+    if (!token?.access_token) {
+      return res.status(400).json({ error: "No access token" });
+    }
+
+    const base = tenantApiBase(domain);
+
+    const r = await fetch(`${base}/api/v1/upload/setting`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token.access_token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({
+        uploadType: "file",
+        fileName: "test.jpg"
+      })
+    });
+
+    const text = await r.text();
+
+    res.json({
+      httpStatus: r.status,
+      isHtml: text.trim().startsWith("<"),
+      textStart: text.slice(0, 200),
+      raw: text
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /* ================================================================
    MAPPING API
